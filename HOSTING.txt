@@ -1,0 +1,6 @@
+﻿Permanent PWA URL: https://surajpratapsomvanshi-create.github.io/atomic-habits/
+Source: this folder is the GitHub Pages site root for the atomic-habits repository.
+Host: GitHub Pages (project site, branch main, path /)
+Package ID: com.atomichabits.tracker
+Signing: reused apk/extracted/signing.keystore
+Previous temporary host: https://atomic-habits-suraj.surge.sh (left in place; not deleted)
