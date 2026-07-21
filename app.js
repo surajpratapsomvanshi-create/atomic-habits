@@ -47,6 +47,8 @@ let modalScheduleKind = "daily";
 let modalWeekdays = [1, 3, 5];
 let modalOnceDate = todayStr();
 let modalDailyLimit = "";
+/** Bad-habit Stats compare mode: full-day average vs pace-until-now. */
+let counterPaceMode = "full"; // "full" | "until"
 let syncTimer = null;
 /** Auto-sync stays disarmed until cloud state is loaded or confirmed empty. */
 let autoSyncArmed = false;
@@ -180,21 +182,49 @@ function nextSortIndex() {
 /**
  * Reorder active habits so the visible subset matches `orderedVisibleIds`
  * (other active habits keep their relative slots). Persists + syncs.
+ *
+ * IMPORTANT: never do `arr.find(x => x.id === ids[vi++])` — find() invokes the
+ * predicate on every candidate, so vi++ burns through the id list and drops habits.
  */
 function applyVisibleHabitOrder(orderedVisibleIds) {
   if (!Array.isArray(orderedVisibleIds) || orderedVisibleIds.length < 2) return;
   const active = activeHabits();
-  const visibleSet = new Set(orderedVisibleIds);
+  if (active.length < 2) return;
+
+  const byId = new Map(active.map(h => [String(h.id), h]));
+  const orderedUnique = [];
+  const seenOrdered = new Set();
+  for (const raw of orderedVisibleIds) {
+    const id = String(raw);
+    if (!byId.has(id) || seenOrdered.has(id)) continue;
+    orderedUnique.push(id);
+    seenOrdered.add(id);
+  }
+  if (orderedUnique.length < 2) return;
+
   let vi = 0;
   const reordered = [];
   for (const h of active) {
-    if (visibleSet.has(h.id)) {
-      const next = active.find(x => x.id === orderedVisibleIds[vi++]);
-      if (next) reordered.push(next);
+    if (seenOrdered.has(String(h.id))) {
+      const nextId = orderedUnique[vi++];
+      const next = byId.get(nextId);
+      // Fail-safe: never skip a slot — keep the original habit if lookup fails.
+      reordered.push(next || h);
     } else {
       reordered.push(h);
     }
   }
+
+  // Absolute fail-safe: refuse to persist if any active habit would be lost.
+  if (
+    reordered.length !== active.length ||
+    new Set(reordered.map(h => String(h.id))).size !== active.length
+  ) {
+    console.warn("Habit reorder aborted — would drop or duplicate habits");
+    render();
+    return;
+  }
+
   reordered.forEach((h, i) => { h.sortIndex = i; });
   const archived = data.habits.filter(h => h.archived);
   archived.forEach((h, i) => { h.sortIndex = reordered.length + i; });
@@ -702,6 +732,15 @@ function renderStats() {
     card.querySelector(".stat-meta").textContent = meta;
     listEl.appendChild(card);
   }
+  listEl.querySelectorAll("[data-pace]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const mode = btn.dataset.pace;
+      if (mode !== "full" && mode !== "until") return;
+      if (counterPaceMode === mode) return;
+      counterPaceMode = mode;
+      renderStats();
+    });
+  });
   enableHabitListDrag(listEl);
 }
 
@@ -729,7 +768,7 @@ function dayProgressFraction(now) {
 
 /**
  * Primary Stats viz for COUNTER habits: Today / Yesterday / 2 Days Ago
- * horizontal bars vs full-day target, with a shared "Track till hour" band.
+ * vs average (or daily limit), with Full day | Until now pace modes.
  */
 function renderTrackTillHourChart(h) {
   const { target, source } = counterDayTarget(h);
@@ -737,16 +776,25 @@ function renderTrackTillHourChart(h) {
   const rows = [
     { key: "today", label: "Today", date: today, isToday: true },
     { key: "yesterday", label: "Yesterday", date: addDays(today, -1), isToday: false },
-    { key: "twoAgo", label: "2 Days Ago", date: addDays(today, -2), isToday: false },
+    { key: "twoAgo", label: "2 days ago", date: addDays(today, -2), isToday: false },
   ].map(r => ({ ...r, count: getCount(h.id, r.date) }));
+
+  const untilMode = counterPaceMode === "until";
+  const targetNoun = source === "limit" ? "limit" : "average";
+  const targetLine =
+    source === "limit"
+      ? `Limit: ${formatTarget(target)}/day`
+      : target != null
+        ? `Average: ${formatTarget(target)}/day`
+        : "Average: —";
 
   if (target == null || !(target > 0)) {
     return (
       `<div class="track-chart">
-         <div class="track-chart-title">Today's Target (Based on Full Day Average)</div>
+         <div class="track-chart-title">Pace vs average</div>
          <div class="track-pending">
-           <p>Set a daily limit</p>
-           <span>Or log counts on a prior day to build an average target.</span>
+           <p>No average yet</p>
+           <span>Set a daily limit, or log counts on a prior day.</span>
          </div>
          ${renderMiniCountChart(h)}
        </div>`
@@ -757,46 +805,50 @@ function renderTrackTillHourChart(h) {
   const hourFrac = dayProgressFraction(now);
   const expected = target * hourFrac;
   const maxCount = rows.reduce((m, r) => Math.max(m, r.count), 0);
-  const scaleMax = Math.max(target, maxCount, expected, 1);
-  const trackPct = Math.min(100, (expected / scaleMax) * 100);
-  const targetPct = Math.min(100, (target / scaleMax) * 100);
-  const hourLabel = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-
-  const targetLabel =
-    source === "limit"
-      ? `Daily limit ${formatTarget(target)}`
-      : `Full-day avg ${formatTarget(target)}`;
+  const scaleMax = Math.max(target, maxCount, untilMode ? expected : 0, 1);
+  const expectedPct = Math.min(100, (expected / scaleMax) * 100);
 
   let rowHtml = "";
   for (const row of rows) {
-    const barPct = Math.min(100, (row.count / scaleMax) * 100);
-    // Strict rule: count >= target/average → red, otherwise green.
-    const atOrOverTarget = row.count >= target;
-    const tone = atOrOverTarget ? "over" : "ok";
+    const compareTo = row.isToday && untilMode ? expected : target;
+    const compareLabel = row.isToday && untilMode ? "expected" : targetNoun === "limit" ? "limit" : "avg";
+    const atOrOver = row.count >= compareTo;
+    const tone = atOrOver ? "over" : "ok";
     const showBar = row.count > 0;
+    const barPct = Math.min(100, (row.count / scaleMax) * 100);
     const fillW = showBar ? Math.max(barPct, 2.5) : 0;
+    const vals = `${row.count} used · ${compareLabel} ${formatTarget(compareTo)}`;
     rowHtml +=
-      `<div class="track-row${row.isToday ? " is-today" : ""}" title="${row.date}: ${row.count} / ${formatTarget(target)}">
+      `<div class="track-row${row.isToday ? " is-today" : ""}${untilMode && row.isToday ? " has-expected" : ""}" title="${row.date}: ${vals}">
          <div class="track-label">${row.label}</div>
-         <div class="track-rail">
-           <div class="track-till-region" style="width:${trackPct.toFixed(2)}%"></div>
-           <div class="track-till-edge" style="left:${trackPct.toFixed(2)}%"></div>
-           ${targetPct < 99.5 ? `<div class="track-target-mark" style="left:${targetPct.toFixed(2)}%"></div>` : ""}
-           ${showBar ? `<div class="track-fill tone-${tone}" style="width:${fillW.toFixed(2)}%"></div>` : `<div class="track-fill empty"></div>`}
+         <div class="track-rail-wrap">
+           ${untilMode && row.isToday
+             ? `<div class="track-expected-caption">Expected by now · ${formatTarget(expected)}</div>`
+             : ""}
+           <div class="track-rail">
+             ${untilMode && row.isToday
+               ? `<div class="track-expected-mark" style="left:${expectedPct.toFixed(2)}%" aria-hidden="true"></div>`
+               : ""}
+             ${showBar ? `<div class="track-fill tone-${tone}" style="width:${fillW.toFixed(2)}%"></div>` : `<div class="track-fill empty"></div>`}
+           </div>
          </div>
-         <div class="track-vals${atOrOverTarget ? " over" : ""}">${row.count}&nbsp;/&nbsp;${formatTarget(target)}</div>
+         <div class="track-vals${atOrOver ? " over" : ""}">${vals}</div>
        </div>`;
   }
 
   return (
     `<div class="track-chart">
        <div class="track-chart-head">
-         <div class="track-chart-title">Today's Target (Based on Full Day Average)</div>
-         <div class="track-chart-sub">${targetLabel} · track till ${hourLabel}</div>
+         <div class="track-chart-title">Pace vs average</div>
+         <div class="track-chart-sub">${targetLine}</div>
+       </div>
+       <div class="pace-toggle" role="group" aria-label="Compare mode">
+         <button type="button" class="pace-opt${untilMode ? "" : " selected"}" data-pace="full">Full day</button>
+         <button type="button" class="pace-opt${untilMode ? " selected" : ""}" data-pace="until">Until now</button>
        </div>
        <div class="track-legend">
-         <span class="track-legend-item till"><i></i>Track till hour</span>
-         <span class="track-legend-item target"><i></i>Full day</span>
+         <span class="track-legend-item ok"><i></i>Under ${targetNoun}</span>
+         <span class="track-legend-item over"><i></i>At/over ${targetNoun}</span>
        </div>
        <div class="track-rows">${rowHtml}</div>
        ${renderMiniCountChart(h)}
@@ -934,11 +986,22 @@ function finishHabitDrag() {
   listEl.classList.remove("is-reordering");
   document.body.classList.remove("habit-drag-active");
 
-  const orderedIds = [...listEl.querySelectorAll("[data-habit-id]")].map(el => el.dataset.habitId);
-  const visiblePrev = activeHabits().map(h => h.id).filter(id => orderedIds.includes(id));
-  const changed = orderedIds.length === visiblePrev.length &&
-    orderedIds.some((id, i) => id !== visiblePrev[i]);
-  if (changed) applyVisibleHabitOrder(orderedIds);
+  const orderedIds = [...listEl.querySelectorAll("[data-habit-id]")]
+    .map(el => el.dataset.habitId)
+    .filter(id => id != null && id !== "");
+  // Deduplicate while preserving DOM order (guards against nested/stray attrs).
+  const seen = new Set();
+  const uniqueOrdered = [];
+  for (const id of orderedIds) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    uniqueOrdered.push(id);
+  }
+  const visiblePrev = activeHabits().map(h => String(h.id)).filter(id => seen.has(id));
+  const changed = uniqueOrdered.length === visiblePrev.length &&
+    uniqueOrdered.length >= 2 &&
+    uniqueOrdered.some((id, i) => id !== visiblePrev[i]);
+  if (changed) applyVisibleHabitOrder(uniqueOrdered);
   else render();
 }
 
