@@ -8,7 +8,8 @@
        schedule: { kind: "daily" } |
                  { kind: "weekdays", weekdays: [0-6] } |
                  { kind: "once", date: "YYYY-MM-DD" },
-       dailyLimit: number | null   // bad habits only
+       dailyLimit: number | null,  // bad habits only
+       sortIndex: number           // display order (Today + Stats)
      }],
      checks: { "YYYY-MM-DD": ["habitId", ...] },   // good habits
      counts: { "YYYY-MM-DD": { habitId: number } } // bad habits
@@ -29,6 +30,8 @@ const DOW_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MIN_AVG_HISTORY_DAYS = 1;
 const EDIT_ICON =
   `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const DRAG_HANDLE =
+  `<button class="habit-drag" type="button" aria-label="Drag to reorder" title="Drag to reorder"><span aria-hidden="true">⋮⋮</span></button>`;
 
 let data = migrateData(load(LS_DATA, { habits: [], checks: {}, counts: {} }));
 let settings = loadSettings();
@@ -91,6 +94,12 @@ function saveSettings() { localStorage.setItem(LS_SETTINGS, JSON.stringify(setti
 function migrateData(raw) {
   if (!raw || typeof raw !== "object") return { habits: [], checks: {}, counts: {} };
   const habits = Array.isArray(raw.habits) ? raw.habits.map(migrateHabit) : [];
+  // Existing habits without sortIndex inherit current array order.
+  habits.forEach((h, i) => {
+    if (h && (h.sortIndex == null || !Number.isFinite(Number(h.sortIndex)))) h.sortIndex = i;
+  });
+  habits.sort((a, b) => (a.sortIndex - b.sortIndex) || String(a.id).localeCompare(String(b.id)));
+  habits.forEach((h, i) => { h.sortIndex = i; });
   const checks = raw.checks && typeof raw.checks === "object" ? raw.checks : {};
   const counts = raw.counts && typeof raw.counts === "object" ? raw.counts : {};
   return { habits, checks, counts };
@@ -117,6 +126,7 @@ function migrateHabit(h) {
     const n = Number(h.dailyLimit);
     if (Number.isFinite(n) && n >= 0) dailyLimit = Math.floor(n);
   }
+  const sortRaw = h.sortIndex != null ? Number(h.sortIndex) : NaN;
   return {
     id: h.id,
     name: h.name || "Habit",
@@ -127,6 +137,7 @@ function migrateHabit(h) {
     type,
     schedule,
     dailyLimit,
+    sortIndex: Number.isFinite(sortRaw) ? sortRaw : null,
   };
 }
 
@@ -150,7 +161,48 @@ function weekdayOf(str) {
 }
 
 /* ---------------- schedule / habit helpers ---------------- */
-function activeHabits() { return data.habits.filter(h => !h.archived); }
+function activeHabits() {
+  return data.habits
+    .filter(h => !h.archived)
+    .slice()
+    .sort((a, b) => (a.sortIndex - b.sortIndex) || String(a.id).localeCompare(String(b.id)));
+}
+
+function nextSortIndex() {
+  let max = -1;
+  for (const h of data.habits) {
+    const n = Number(h.sortIndex);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return max + 1;
+}
+
+/**
+ * Reorder active habits so the visible subset matches `orderedVisibleIds`
+ * (other active habits keep their relative slots). Persists + syncs.
+ */
+function applyVisibleHabitOrder(orderedVisibleIds) {
+  if (!Array.isArray(orderedVisibleIds) || orderedVisibleIds.length < 2) return;
+  const active = activeHabits();
+  const visibleSet = new Set(orderedVisibleIds);
+  let vi = 0;
+  const reordered = [];
+  for (const h of active) {
+    if (visibleSet.has(h.id)) {
+      const next = active.find(x => x.id === orderedVisibleIds[vi++]);
+      if (next) reordered.push(next);
+    } else {
+      reordered.push(h);
+    }
+  }
+  reordered.forEach((h, i) => { h.sortIndex = i; });
+  const archived = data.habits.filter(h => h.archived);
+  archived.forEach((h, i) => { h.sortIndex = reordered.length + i; });
+  data.habits = [...reordered, ...archived];
+  saveData();
+  queueSync();
+  render();
+}
 
 /**
  * Whether a habit appears on a given date for scheduling / back-fill.
@@ -404,7 +456,7 @@ function renderHeader() {
     document.getElementById("header-date").textContent = prettyDate(selectedDate);
   }
 
-  const goods = goodHabitsForDate(selectedDate);
+  const goods = goodHabitsForDate(selectedDate); // counters never affect the ring
   const done = goods.filter(h => isChecked(h.id, selectedDate)).length;
   const pct = goods.length ? Math.round((done / goods.length) * 100) : 0;
   const C = 2 * Math.PI * 19;
@@ -477,12 +529,16 @@ function renderHabits() {
   emptyEl.classList.add("hidden");
 
   for (const h of habits) {
+    let card;
     if (h.type === "bad") {
-      listEl.appendChild(renderBadHabitCard(h));
+      card = renderBadHabitCard(h);
     } else {
-      listEl.appendChild(renderGoodHabitCard(h));
+      card = renderGoodHabitCard(h);
     }
+    card.dataset.habitId = h.id;
+    listEl.appendChild(card);
   }
+  enableHabitListDrag(listEl);
 }
 
 function renderGoodHabitCard(h) {
@@ -496,6 +552,7 @@ function renderGoodHabitCard(h) {
     ? `<span class="habit-pill streak">${streak} day${streak > 1 ? "s" : ""}</span>`
     : "";
   card.innerHTML =
+    DRAG_HANDLE +
     `<div class="habit-emoji" style="background:${emojiBg(h.color)}">${h.emoji}</div>` +
     `<div class="habit-info">
        <div class="habit-name"></div>
@@ -547,6 +604,7 @@ function renderBadHabitCard(h) {
   ].join("");
 
   card.innerHTML =
+    DRAG_HANDLE +
     `<div class="habit-emoji" style="background:${emojiBg(h.color)}">${h.emoji}</div>` +
     `<div class="habit-info">
        <div class="habit-name"></div>
@@ -605,6 +663,7 @@ function renderStats() {
   for (const h of habits) {
     const card = document.createElement("div");
     card.className = "stat-card" + (h.type === "bad" ? " bad" : "");
+    card.dataset.habitId = h.id;
 
     let meta;
     let chartHtml;
@@ -613,7 +672,7 @@ function renderStats() {
       const avgTxt = samples >= MIN_AVG_HISTORY_DAYS ? avg.toFixed(1) : "n/a";
       meta = `Σ ${totalCountSum(h.id)} · ${daysWithCount(h.id)} days · avg ${avgTxt}` +
         (h.dailyLimit != null ? ` · limit ${h.dailyLimit}` : "");
-      chartHtml = renderCountChart(h, samples >= MIN_AVG_HISTORY_DAYS ? avg : null);
+      chartHtml = renderTrackTillHourChart(h);
     } else {
       meta = `${currentStreak(h.id)} streak · best ${bestStreak(h.id)} · ${completionRate(h.id)}%`;
       let cells = "";
@@ -630,6 +689,7 @@ function renderStats() {
 
     card.innerHTML =
       `<div class="stat-head">
+         ${DRAG_HANDLE}
          <div class="habit-emoji" style="background:${emojiBg(h.color)}">${h.emoji}</div>
          <div class="stat-title-wrap">
            <div class="stat-title"></div>
@@ -642,15 +702,118 @@ function renderStats() {
     card.querySelector(".stat-meta").textContent = meta;
     listEl.appendChild(card);
   }
+  enableHabitListDrag(listEl);
 }
 
 /**
- * 14-day bar chart with data labels for a bad-habit counter.
- * Bars over the daily limit turn red; a dashed line marks the historical average.
+ * Full-day target for a bad-habit counter:
+ * prefer configured dailyLimit (> 0), else historical full-day average
+ * from prior days with recorded counts (excludes today).
  */
-function renderCountChart(h, avg) {
-  const DAYS = 14;
+function counterDayTarget(h) {
+  if (h.dailyLimit != null && h.dailyLimit > 0) {
+    return { target: h.dailyLimit, source: "limit" };
+  }
+  const { avg, samples } = historicalAverage(h.id);
+  if (avg != null && samples >= MIN_AVG_HISTORY_DAYS) {
+    return { target: avg, source: "average" };
+  }
+  return { target: null, source: "none" };
+}
+
+/** Fraction of the local day elapsed (0–1), using hour + minute. */
+function dayProgressFraction(now) {
+  const d = now || new Date();
+  return (d.getHours() + d.getMinutes() / 60) / 24;
+}
+
+/**
+ * Primary Stats viz for COUNTER habits: Today / Yesterday / 2 Days Ago
+ * horizontal bars vs full-day target, with a shared "Track till hour" band.
+ */
+function renderTrackTillHourChart(h) {
+  const { target, source } = counterDayTarget(h);
   const today = todayStr();
+  const rows = [
+    { key: "today", label: "Today", date: today, isToday: true },
+    { key: "yesterday", label: "Yesterday", date: addDays(today, -1), isToday: false },
+    { key: "twoAgo", label: "2 Days Ago", date: addDays(today, -2), isToday: false },
+  ].map(r => ({ ...r, count: getCount(h.id, r.date) }));
+
+  if (target == null || !(target > 0)) {
+    return (
+      `<div class="track-chart">
+         <div class="track-chart-title">Today's Target (Based on Full Day Average)</div>
+         <div class="track-pending">
+           <p>Set a daily limit</p>
+           <span>Or log counts on a prior day to build an average target.</span>
+         </div>
+         ${renderMiniCountChart(h)}
+       </div>`
+    );
+  }
+
+  const now = new Date();
+  const hourFrac = dayProgressFraction(now);
+  const expected = target * hourFrac;
+  const maxCount = rows.reduce((m, r) => Math.max(m, r.count), 0);
+  const scaleMax = Math.max(target, maxCount, expected, 1);
+  const trackPct = Math.min(100, (expected / scaleMax) * 100);
+  const targetPct = Math.min(100, (target / scaleMax) * 100);
+  const hourLabel = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+
+  const targetLabel =
+    source === "limit"
+      ? `Daily limit ${formatTarget(target)}`
+      : `Full-day avg ${formatTarget(target)}`;
+
+  let rowHtml = "";
+  for (const row of rows) {
+    const barPct = Math.min(100, (row.count / scaleMax) * 100);
+    // Strict rule: count >= target/average → red, otherwise green.
+    const atOrOverTarget = row.count >= target;
+    const tone = atOrOverTarget ? "over" : "ok";
+    const showBar = row.count > 0;
+    const fillW = showBar ? Math.max(barPct, 2.5) : 0;
+    rowHtml +=
+      `<div class="track-row${row.isToday ? " is-today" : ""}" title="${row.date}: ${row.count} / ${formatTarget(target)}">
+         <div class="track-label">${row.label}</div>
+         <div class="track-rail">
+           <div class="track-till-region" style="width:${trackPct.toFixed(2)}%"></div>
+           <div class="track-till-edge" style="left:${trackPct.toFixed(2)}%"></div>
+           ${targetPct < 99.5 ? `<div class="track-target-mark" style="left:${targetPct.toFixed(2)}%"></div>` : ""}
+           ${showBar ? `<div class="track-fill tone-${tone}" style="width:${fillW.toFixed(2)}%"></div>` : `<div class="track-fill empty"></div>`}
+         </div>
+         <div class="track-vals${atOrOverTarget ? " over" : ""}">${row.count}&nbsp;/&nbsp;${formatTarget(target)}</div>
+       </div>`;
+  }
+
+  return (
+    `<div class="track-chart">
+       <div class="track-chart-head">
+         <div class="track-chart-title">Today's Target (Based on Full Day Average)</div>
+         <div class="track-chart-sub">${targetLabel} · track till ${hourLabel}</div>
+       </div>
+       <div class="track-legend">
+         <span class="track-legend-item till"><i></i>Track till hour</span>
+         <span class="track-legend-item target"><i></i>Full day</span>
+       </div>
+       <div class="track-rows">${rowHtml}</div>
+       ${renderMiniCountChart(h)}
+     </div>`
+  );
+}
+
+function formatTarget(n) {
+  if (n == null || !Number.isFinite(n)) return "—";
+  return Number.isInteger(n) ? String(n) : (Math.round(n * 10) / 10).toFixed(1);
+}
+
+/** Compact 7-day spark bars under the primary track chart (secondary). */
+function renderMiniCountChart(h) {
+  const DAYS = 7;
+  const today = todayStr();
+  const { target } = counterDayTarget(h);
   const days = [];
   let max = 0;
   for (let i = DAYS - 1; i >= 0; i--) {
@@ -659,40 +822,124 @@ function renderCountChart(h, avg) {
     if (c > max) max = c;
     days.push({ date: d, count: c, isToday: i === 0 });
   }
-  const scaleMax = Math.max(max, h.dailyLimit != null ? h.dailyLimit : 0, 1);
-
+  const scaleMax = Math.max(max, target != null ? target : 0, h.dailyLimit != null ? h.dailyLimit : 0, 1);
   let cols = "";
   for (const day of days) {
-    const pct = Math.round((day.count / scaleMax) * 100);
-    const over = h.dailyLimit != null && day.count > h.dailyLimit;
-    const zero = day.count === 0;
+    const pct = day.count <= 0 ? 0 : Math.max(12, Math.round((day.count / scaleMax) * 100));
+    const over = target != null ? day.count >= target : (h.dailyLimit != null && day.count >= h.dailyLimit);
+    const under = day.count > 0 && !over;
+    const toneCls = over ? " over" : under ? " under" : "";
     const dom = Number(day.date.split("-")[2]);
-    const barCls = "bar" + (over ? " over" : "") + (zero ? " zero" : "");
-    const valCls = "bar-val" + (over ? " over" : "") + (zero ? " zero" : "");
     cols +=
-      `<div class="chart-col${day.isToday ? " today" : ""}" title="${day.date}: ${day.count}">
-         <span class="${valCls}">${day.count}</span>
-         <div class="bar-wrap"><div class="${barCls}" style="height:${zero ? 3 : Math.max(pct, 6)}%"></div></div>
-         <span class="bar-day">${dom}</span>
+      `<div class="mini-col${day.isToday ? " today" : ""}${toneCls}${day.count === 0 ? " zero" : ""}" title="${day.date}: ${day.count}">
+         <div class="mini-bar-wrap"><div class="mini-bar" style="height:${day.count === 0 ? 3 : pct}%"></div></div>
+         <span class="mini-day">${dom}</span>
        </div>`;
   }
+  return `<div class="mini-count-chart" aria-label="Last 7 days"><div class="mini-count-label">Last 7 days</div><div class="mini-count-body">${cols}</div></div>`;
+}
 
-  let avgLine = "";
-  let legend = "";
-  if (avg != null) {
-    // The avg text lives in a legend row above the chart so it can never
-    // collide with per-bar value labels; only the dashed line is in the plot.
-    // Bar area insets: 13px top (10px value row + 3px gap), 13px bottom (day row).
-    const pct = Math.min(avg / scaleMax, 1);
-    avgLine = `<div class="avg-line" style="bottom:calc(13px + (100% - 26px) * ${pct.toFixed(4)})"></div>`;
-    legend = `<div class="chart-legend"><span class="legend-pill">avg ${avg.toFixed(1)}</span>` +
-      (h.dailyLimit != null ? `<span class="legend-pill limit">limit ${h.dailyLimit}</span>` : "") +
-      `</div>`;
-  } else if (h.dailyLimit != null) {
-    legend = `<div class="chart-legend"><span class="legend-pill limit">limit ${h.dailyLimit}</span></div>`;
+/* ---------------- drag-to-reorder (Today + Stats) ---------------- */
+let habitDragState = null;
+
+function enableHabitListDrag(listEl) {
+  if (!listEl) return;
+  const cards = [...listEl.querySelectorAll("[data-habit-id]")];
+  if (cards.length < 2) return;
+  for (const card of cards) {
+    const handle = card.querySelector(".habit-drag");
+    if (!handle || handle.dataset.dragBound) continue;
+    handle.dataset.dragBound = "1";
+    handle.addEventListener("pointerdown", e => {
+      if (e.button != null && e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      beginHabitDrag(card, listEl, e);
+    });
   }
+}
 
-  return `<div class="count-chart">${legend}<div class="chart-body">${avgLine}${cols}</div></div>`;
+function beginHabitDrag(card, listEl, e) {
+  if (habitDragState) return;
+  const handle = card.querySelector(".habit-drag");
+  const cards = () => [...listEl.querySelectorAll("[data-habit-id]:not(.habit-drag-ghost)")];
+  const rect = card.getBoundingClientRect();
+  const ghost = card.cloneNode(true);
+  ghost.classList.add("habit-drag-ghost");
+  ghost.removeAttribute("data-habit-id");
+  ghost.style.width = rect.width + "px";
+  ghost.style.height = rect.height + "px";
+  ghost.style.left = rect.left + "px";
+  ghost.style.top = rect.top + "px";
+  document.body.appendChild(ghost);
+
+  const placeholder = document.createElement("div");
+  placeholder.className = "habit-drag-placeholder";
+  placeholder.style.height = rect.height + "px";
+  card.after(placeholder);
+  card.classList.add("habit-dragging-source");
+
+  habitDragState = {
+    listEl,
+    card,
+    ghost,
+    placeholder,
+    offsetY: e.clientY - rect.top,
+    pointerId: e.pointerId,
+  };
+
+  try { handle.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  listEl.classList.add("is-reordering");
+  document.body.classList.add("habit-drag-active");
+
+  const onMove = ev => {
+    if (!habitDragState || ev.pointerId !== habitDragState.pointerId) return;
+    ev.preventDefault();
+    ghost.style.top = (ev.clientY - habitDragState.offsetY) + "px";
+    const midY = ev.clientY;
+    const siblings = cards().filter(c => c !== card);
+    let inserted = false;
+    for (const sib of siblings) {
+      const r = sib.getBoundingClientRect();
+      if (midY < r.top + r.height / 2) {
+        listEl.insertBefore(placeholder, sib);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) listEl.appendChild(placeholder);
+  };
+
+  const onUp = ev => {
+    if (!habitDragState || ev.pointerId !== habitDragState.pointerId) return;
+    finishHabitDrag();
+    window.removeEventListener("pointermove", onMove, true);
+    window.removeEventListener("pointerup", onUp, true);
+    window.removeEventListener("pointercancel", onUp, true);
+  };
+
+  window.addEventListener("pointermove", onMove, true);
+  window.addEventListener("pointerup", onUp, true);
+  window.addEventListener("pointercancel", onUp, true);
+}
+
+function finishHabitDrag() {
+  const state = habitDragState;
+  habitDragState = null;
+  if (!state) return;
+  const { listEl, card, ghost, placeholder } = state;
+  placeholder.replaceWith(card);
+  card.classList.remove("habit-dragging-source");
+  ghost.remove();
+  listEl.classList.remove("is-reordering");
+  document.body.classList.remove("habit-drag-active");
+
+  const orderedIds = [...listEl.querySelectorAll("[data-habit-id]")].map(el => el.dataset.habitId);
+  const visiblePrev = activeHabits().map(h => h.id).filter(id => orderedIds.includes(id));
+  const changed = orderedIds.length === visiblePrev.length &&
+    orderedIds.some((id, i) => id !== visiblePrev[i]);
+  if (changed) applyVisibleHabitOrder(orderedIds);
+  else render();
 }
 
 /* ---------------- habit modal ---------------- */
@@ -826,6 +1073,7 @@ function saveHabit() {
       ...fields,
       createdAt: todayStr(),
       archived: false,
+      sortIndex: nextSortIndex(),
     });
   }
   saveData();
@@ -1306,9 +1554,9 @@ if (!localStorage.getItem(LS_DATA)) {
   // Seed createdAt a month back so the current week is never empty for new users
   const seedCreated = addDays(todayStr(), -30);
   data.habits = [
-    { id: "h-seed1", name: "Brush teeth", emoji: "🦷", color: COLORS[0], createdAt: seedCreated, archived: false, type: "good", schedule: { kind: "daily" }, dailyLimit: null },
-    { id: "h-seed2", name: "Drink water", emoji: "💧", color: COLORS[6], createdAt: seedCreated, archived: false, type: "good", schedule: { kind: "daily" }, dailyLimit: null },
-    { id: "h-seed3", name: "Read 10 minutes", emoji: "📖", color: COLORS[2], createdAt: seedCreated, archived: false, type: "good", schedule: { kind: "daily" }, dailyLimit: null },
+    { id: "h-seed1", name: "Brush teeth", emoji: "🦷", color: COLORS[0], createdAt: seedCreated, archived: false, type: "good", schedule: { kind: "daily" }, dailyLimit: null, sortIndex: 0 },
+    { id: "h-seed2", name: "Drink water", emoji: "💧", color: COLORS[6], createdAt: seedCreated, archived: false, type: "good", schedule: { kind: "daily" }, dailyLimit: null, sortIndex: 1 },
+    { id: "h-seed3", name: "Read 10 minutes", emoji: "📖", color: COLORS[2], createdAt: seedCreated, archived: false, type: "good", schedule: { kind: "daily" }, dailyLimit: null, sortIndex: 2 },
   ];
   data.checks = {};
   data.counts = {};
