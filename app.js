@@ -350,9 +350,41 @@ function nextListSortIndex() {
   return max + 1;
 }
 
+/** Trim + lowercase for case-insensitive name compares. */
+function normalizeNameKey(name) {
+  return String(name || "").trim().toLowerCase();
+}
+
+/** True if another list already uses this name (case-insensitive). */
+function listNameTaken(name, excludeId) {
+  const key = normalizeNameKey(name);
+  if (!key) return false;
+  return (data.lists || []).some(l =>
+    l && String(l.id) !== String(excludeId || "") && normalizeNameKey(l.name) === key
+  );
+}
+
+/**
+ * Active (non-archived) habit with the same name (trimmed, case-insensitive),
+ * excluding excludeId. Scans all lists — no duplicate names among active habits.
+ */
+function findDuplicateActiveHabit(name, excludeId) {
+  const key = normalizeNameKey(name);
+  if (!key) return null;
+  return (data.habits || []).find(h =>
+    h && !h.archived &&
+    String(h.id) !== String(excludeId || "") &&
+    normalizeNameKey(h.name) === key
+  ) || null;
+}
+
 function createList(name) {
   const trimmed = String(name || "").trim();
   if (!trimmed) { toast("Give your list a name"); return null; }
+  if (listNameTaken(trimmed)) {
+    toast("A list with this name already exists");
+    return null;
+  }
   const list = {
     id: "list-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
     name: trimmed,
@@ -373,6 +405,10 @@ function renameList(listId, name) {
   if (!list) return false;
   const trimmed = String(name || "").trim();
   if (!trimmed) { toast("Give your list a name"); return false; }
+  if (listNameTaken(trimmed, list.id)) {
+    toast("A list with this name already exists");
+    return false;
+  }
   list.name = trimmed;
   saveData();
   queueSync();
@@ -1103,19 +1139,7 @@ function renderBadHabitCard(h) {
 
 function renderStats() {
   const habits = activeHabits();
-  const summaryEl = document.getElementById("stats-summary");
   const listEl = document.getElementById("stats-list");
-
-  const goodHabits = habits.filter(h => h.type !== "bad");
-  const badHabits = habits.filter(h => h.type === "bad");
-  const totalDone = Object.values(data.checks).reduce((a, l) => a + l.length, 0);
-  const bestOverall = goodHabits.reduce((a, h) => Math.max(a, bestStreak(h.id)), 0);
-  const totalBadCounts = badHabits.reduce((a, h) => a + totalCountSum(h.id), 0);
-
-  summaryEl.innerHTML =
-    `<div class="summary-tile"><div class="num">${habits.length}</div><div class="lbl">Habits</div></div>` +
-    `<div class="summary-tile"><div class="num">${totalDone}</div><div class="lbl">Check-ins</div></div>` +
-    `<div class="summary-tile"><div class="num">${badHabits.length ? totalBadCounts : bestOverall + (bestOverall ? "🔥" : "")}</div><div class="lbl">${badHabits.length ? "Counter taps" : "Best streak"}</div></div>`;
 
   listEl.innerHTML = "";
   if (!habits.length) {
@@ -1327,13 +1351,15 @@ function renderMiniCountChart(h) {
   const scaleMax = Math.max(max, target != null ? target : 0, h.dailyLimit != null ? h.dailyLimit : 0, 1);
   let cols = "";
   for (const day of days) {
-    const pct = day.count <= 0 ? 0 : Math.max(12, Math.round((day.count / scaleMax) * 100));
+    // Floor keeps a zero-height bar visible without flattening relative scale.
+    const pct = day.count <= 0 ? 0 : Math.max(6, Math.round((day.count / scaleMax) * 100));
     const over = target != null ? day.count >= target : (h.dailyLimit != null && day.count >= h.dailyLimit);
     const under = day.count > 0 && !over;
     const toneCls = over ? " over" : under ? " under" : "";
     const dom = Number(day.date.split("-")[2]);
     cols +=
       `<div class="mini-col${day.isToday ? " today" : ""}${toneCls}${day.count === 0 ? " zero" : ""}" title="${day.date}: ${day.count}">
+         <span class="mini-val${day.count === 0 ? " zero" : ""}">${day.count}</span>
          <div class="mini-bar-wrap"><div class="mini-bar" style="height:${day.count === 0 ? 3 : pct}%"></div></div>
          <span class="mini-day">${dom}</span>
        </div>`;
@@ -1460,6 +1486,7 @@ function openHabitModal(habitId) {
   editingHabitId = typeof habitId === "string" ? habitId : null;
   const h = editingHabitId ? data.habits.find(x => x.id === editingHabitId) : null;
 
+  clearHabitNameError();
   document.getElementById("modal-title").textContent = h ? "Edit habit" : "New habit";
   document.getElementById("habit-name").value = h ? h.name : "";
   document.getElementById("btn-delete-habit").classList.toggle("hidden", !h);
@@ -1481,6 +1508,7 @@ function openHabitModal(habitId) {
   if (!h) setTimeout(() => document.getElementById("habit-name").focus(), 100);
 }
 function closeHabitModal() {
+  clearHabitNameError();
   document.getElementById("habit-modal").classList.add("hidden");
 }
 
@@ -1576,9 +1604,38 @@ function buildScheduleFromModal() {
   return { kind: "daily" };
 }
 
+function showHabitNameError(msg) {
+  toast(msg);
+  const input = document.getElementById("habit-name");
+  const err = document.getElementById("habit-name-error");
+  if (input) {
+    input.classList.add("input-error");
+    input.setAttribute("aria-invalid", "true");
+    input.focus();
+  }
+  if (err) {
+    err.textContent = msg;
+    err.classList.remove("hidden");
+  }
+}
+
+function clearHabitNameError() {
+  const input = document.getElementById("habit-name");
+  const err = document.getElementById("habit-name-error");
+  if (input) {
+    input.classList.remove("input-error");
+    input.removeAttribute("aria-invalid");
+  }
+  if (err) {
+    err.textContent = "";
+    err.classList.add("hidden");
+  }
+}
+
 function saveHabit() {
+  clearHabitNameError();
   const name = document.getElementById("habit-name").value.trim();
-  if (!name) { toast("Give your habit a name"); return; }
+  if (!name) { showHabitNameError("Give your habit a name"); return; }
   if (modalScheduleKind === "weekdays" && !modalWeekdays.length) {
     toast("Pick at least one weekday");
     return;
@@ -1599,6 +1656,10 @@ function saveHabit() {
     || getActiveListId();
   if (!(data.lists || []).some(l => String(l.id) === String(chosenListId))) {
     toast("Pick a valid list");
+    return;
+  }
+  if (findDuplicateActiveHabit(name, editingHabitId)) {
+    showHabitNameError("A habit with this name already exists");
     return;
   }
   const fields = {
@@ -1861,7 +1922,125 @@ function mergeHabitData(localData, cloudData) {
   let activeListId = loc.activeListId || cld.activeListId || fallbackListId;
   if (!listIds.has(String(activeListId))) activeListId = fallbackListId;
 
-  return migrateData({ habits, checks, counts, lastUsedAt, punches, lists, activeListId });
+  const deduped = dedupeHabitsByName({ habits, checks, counts, lastUsedAt, punches, lists, activeListId });
+  return migrateData(deduped);
+}
+
+/** Completeness score for choosing which duplicate habit to keep. */
+function habitCompletenessScore(h, checks, counts, lastUsedAt, punches) {
+  const id = String(h.id);
+  let score = 0;
+  if (!h.archived) score += 10;
+  for (const day of Object.keys(checks || {})) {
+    if ((checks[day] || []).map(String).includes(id)) score += 2;
+  }
+  for (const day of Object.keys(counts || {})) {
+    const row = counts[day];
+    if (row && Object.prototype.hasOwnProperty.call(row, id)) {
+      score += 1 + (Number(row[id]) || 0);
+    }
+  }
+  if (lastUsedAt && lastUsedAt[id]) score += 2;
+  if (Array.isArray(punches)) {
+    score += punches.filter(p => p && String(p.habitId) === id).length;
+  }
+  if (h.dailyLimit != null) score += 1;
+  if (h.emoji) score += 0.1;
+  if (h.schedule && h.schedule.kind) score += 0.1;
+  return score;
+}
+
+/** Remap all history keys from fromId onto toId, then drop fromId. */
+function remapHabitIdRefs(fromId, toId, checks, counts, lastUsedAt, punches) {
+  const from = String(fromId);
+  const to = String(toId);
+  if (from === to) return;
+  for (const day of Object.keys(checks || {})) {
+    const list = checks[day] || [];
+    let changed = false;
+    const next = [];
+    const seen = new Set();
+    for (const x of list) {
+      const id = String(x) === from ? to : String(x);
+      if (seen.has(id)) { changed = true; continue; }
+      seen.add(id);
+      if (String(x) === from) changed = true;
+      next.push(id);
+    }
+    if (changed) checks[day] = next;
+  }
+  for (const day of Object.keys(counts || {})) {
+    const row = counts[day];
+    if (!row || !Object.prototype.hasOwnProperty.call(row, from)) continue;
+    const merged = Math.max(Number(row[to]) || 0, Number(row[from]) || 0);
+    row[to] = merged;
+    delete row[from];
+  }
+  if (lastUsedAt && Object.prototype.hasOwnProperty.call(lastUsedAt, from)) {
+    lastUsedAt[to] = laterIso(lastUsedAt[to] || null, lastUsedAt[from] || null) || lastUsedAt[from];
+    delete lastUsedAt[from];
+  }
+  if (Array.isArray(punches)) {
+    for (const p of punches) {
+      if (p && String(p.habitId) === from) p.habitId = to;
+    }
+  }
+}
+
+/**
+ * After sync merge: collapse non-archived habits that share a name
+ * (trimmed, case-insensitive). Prefer more complete / lower sortIndex /
+ * earlier id; remap checks/counts/punches/lastUsedAt onto the kept id.
+ */
+function dedupeHabitsByName(payload) {
+  const habits = (payload.habits || []).slice();
+  const checks = payload.checks || {};
+  const counts = payload.counts || {};
+  const lastUsedAt = payload.lastUsedAt || {};
+  const punches = Array.isArray(payload.punches) ? payload.punches.slice() : [];
+
+  const groups = new Map();
+  for (const h of habits) {
+    if (!h || h.archived) continue;
+    const key = normalizeNameKey(h.name);
+    if (!key) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(h);
+  }
+
+  const drop = new Set();
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    group.sort((a, b) => {
+      const sa = habitCompletenessScore(a, checks, counts, lastUsedAt, punches);
+      const sb = habitCompletenessScore(b, checks, counts, lastUsedAt, punches);
+      if (sb !== sa) return sb - sa;
+      const ia = Number(a.sortIndex);
+      const ib = Number(b.sortIndex);
+      const na = Number.isFinite(ia) ? ia : 1e9;
+      const nb = Number.isFinite(ib) ? ib : 1e9;
+      if (na !== nb) return na - nb;
+      return String(a.id).localeCompare(String(b.id));
+    });
+    const keep = group[0];
+    for (let i = 1; i < group.length; i++) {
+      const dup = group[i];
+      // Prefer keep's listId; if keep lacks a valid list and dup has one, adopt it.
+      if (dup.listId != null && (keep.listId == null || keep.listId === "")) {
+        keep.listId = dup.listId;
+      }
+      remapHabitIdRefs(dup.id, keep.id, checks, counts, lastUsedAt, punches);
+      drop.add(String(dup.id));
+    }
+  }
+
+  return Object.assign({}, payload, {
+    habits: habits.filter(h => !drop.has(String(h.id))),
+    checks,
+    counts,
+    lastUsedAt,
+    punches,
+  });
 }
 
 /** Load full cloud snapshot (for merge / conflict resolve). */
@@ -2375,6 +2554,7 @@ document.querySelectorAll(".nav-btn[data-view]").forEach(b =>
 
 document.getElementById("btn-save-habit").addEventListener("click", saveHabit);
 document.getElementById("btn-delete-habit").addEventListener("click", deleteHabit);
+document.getElementById("habit-name").addEventListener("input", clearHabitNameError);
 document.getElementById("habit-modal").addEventListener("click", e => {
   if (e.target.id === "habit-modal") closeHabitModal();
 });
@@ -2583,6 +2763,10 @@ try {
     deleteList,
     moveHabitToList,
     getActiveListId,
+    findDuplicateActiveHabit,
+    listNameTaken,
+    dedupeHabitsByName,
+    normalizeNameKey,
   };
 } catch (e) { /* non-browser */ }
 

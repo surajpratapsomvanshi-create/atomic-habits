@@ -81,7 +81,6 @@
         <div class="tasks-card-head">
           <h2 class="tasks-card-title" id="stats-list-title">Statistics</h2>
         </div>
-        <div class="stats-summary" id="stats-summary"></div>
         <div id="stats-list" class="stats-list"></div>
       </section>
     </main>
@@ -184,6 +183,7 @@
         <h2 id="modal-title">New habit</h2>
         <label class="field-label" for="habit-name">Name</label>
         <input type="text" id="habit-name" placeholder="e.g. Brush teeth" maxlength="60" />
+        <p class="field-error hidden" id="habit-name-error" role="alert"></p>
 
         <label class="field-label" for="habit-list-select">List</label>
         <select id="habit-list-select" aria-label="Move to list"></select>
