@@ -14,7 +14,9 @@
        sortIndex: number           // display order within list
      }],
      checks: { "YYYY-MM-DD": ["habitId", ...] },   // good habits
-     counts: { "YYYY-MM-DD": { habitId: number } } // bad habits
+     counts: { "YYYY-MM-DD": { habitId: number } }, // bad habits
+     lastUsedAt: { habitId: ISO datetime },         // clock time of last + / check-on
+     punches: [{ id, habitId, at: ISO, delta: number }] // transactional punch log
    }
    Legacy habits without type/schedule/listId migrate to daily good habits
    on a default "Atomic Habits" list.
@@ -139,7 +141,11 @@ function migrateList(l, index) {
 function migrateData(raw) {
   if (!raw || typeof raw !== "object") {
     const list = makeDefaultList();
-    return { habits: [], checks: {}, counts: {}, lists: [list], activeListId: list.id };
+    return {
+      habits: [], checks: {}, counts: {},
+      lastUsedAt: {}, punches: [],
+      lists: [list], activeListId: list.id,
+    };
   }
 
   let lists = Array.isArray(raw.lists)
@@ -179,9 +185,49 @@ function migrateData(raw) {
 
   const checks = raw.checks && typeof raw.checks === "object" ? raw.checks : {};
   const counts = raw.counts && typeof raw.counts === "object" ? raw.counts : {};
+  const lastUsedAt = migrateLastUsedAt(raw.lastUsedAt);
+  const punches = migratePunches(raw.punches);
   let activeListId = raw.activeListId != null ? String(raw.activeListId) : fallbackListId;
   if (!listIds.has(activeListId)) activeListId = fallbackListId;
-  return { habits, checks, counts, lists, activeListId };
+  return { habits, checks, counts, lastUsedAt, punches, lists, activeListId };
+}
+
+/** Keep only valid habitId → ISO timestamp pairs; missing stays empty. */
+function migrateLastUsedAt(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [id, iso] of Object.entries(raw)) {
+    if (!id) continue;
+    const s = String(iso || "").trim();
+    if (!s) continue;
+    const t = Date.parse(s);
+    if (!Number.isFinite(t)) continue;
+    out[String(id)] = new Date(t).toISOString();
+  }
+  return out;
+}
+
+/** Normalize punch log; drop invalid rows. Cap kept in recordPunch. */
+function migratePunches(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const p of raw) {
+    if (!p || typeof p !== "object") continue;
+    const habitId = p.habitId != null ? String(p.habitId) : "";
+    if (!habitId) continue;
+    const at = String(p.at || "").trim();
+    const t = Date.parse(at);
+    if (!Number.isFinite(t)) continue;
+    const delta = Number(p.delta);
+    if (!Number.isFinite(delta) || delta === 0) continue;
+    out.push({
+      id: String(p.id || ("p-" + t.toString(36))),
+      habitId,
+      at: new Date(t).toISOString(),
+      delta: delta > 0 ? 1 : -1,
+    });
+  }
+  return out;
 }
 
 function migrateHabit(h, fallbackListId, listIds) {
@@ -552,7 +598,11 @@ let justCheckedId = null;
 function toggleCheck(habitId, date) {
   const list = data.checks[date] || (data.checks[date] = []);
   const i = list.indexOf(habitId);
-  if (i >= 0) list.splice(i, 1); else list.push(habitId);
+  if (i >= 0) list.splice(i, 1);
+  else {
+    list.push(habitId);
+    recordPunch(habitId, 1);
+  }
   if (list.length === 0) delete data.checks[date];
   // Flag so the re-render can play the satisfying tick animation once
   justCheckedId = i < 0 ? habitId : null;
@@ -561,6 +611,64 @@ function toggleCheck(habitId, date) {
   justCheckedId = null;
   queueSync();
   if (navigator.vibrate) navigator.vibrate(15);
+}
+
+/* ---------------- punch / last-used timestamps ---------------- */
+const MAX_PUNCHES = 500;
+
+/** Record a clock-time punch. + updates lastUsedAt; − does not. */
+function recordPunch(habitId, delta) {
+  const id = String(habitId || "");
+  if (!id) return;
+  const d = Number(delta);
+  if (!Number.isFinite(d) || d === 0) return;
+  const at = new Date().toISOString();
+  if (!Array.isArray(data.punches)) data.punches = [];
+  data.punches.push({
+    id: "p-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    habitId: id,
+    at,
+    delta: d > 0 ? 1 : -1,
+  });
+  if (data.punches.length > MAX_PUNCHES) {
+    data.punches = data.punches.slice(-MAX_PUNCHES);
+  }
+  if (d > 0) {
+    if (!data.lastUsedAt || typeof data.lastUsedAt !== "object") data.lastUsedAt = {};
+    data.lastUsedAt[id] = at;
+  }
+}
+
+function getLastUsedAt(habitId) {
+  const map = data.lastUsedAt;
+  if (!map || typeof map !== "object") return null;
+  const iso = map[String(habitId)];
+  return iso ? String(iso) : null;
+}
+
+/** Relative label from an ISO timestamp, e.g. "2h ago", "1d ago", "Just now". */
+function formatLastUsedAgo(iso) {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  const mins = Math.max(0, Math.floor((Date.now() - t) / 60000));
+  if (mins < 1) return "Just now";
+  if (mins < 60) return mins + "m ago";
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + "h ago";
+  const days = Math.floor(hours / 24);
+  return days + "d ago";
+}
+
+function laterIso(a, b) {
+  const ta = a ? Date.parse(a) : NaN;
+  const tb = b ? Date.parse(b) : NaN;
+  const aOk = Number.isFinite(ta);
+  const bOk = Number.isFinite(tb);
+  if (aOk && bOk) return ta >= tb ? a : b;
+  if (aOk) return a;
+  if (bOk) return b;
+  return null;
 }
 
 /* ---------------- bad-habit counts ---------------- */
@@ -591,12 +699,15 @@ function setCount(habitId, date, value) {
 }
 
 function incrementCount(habitId, date) {
+  recordPunch(habitId, 1);
   setCount(habitId, date, getCount(habitId, date) + 1);
 }
 
 function decrementCount(habitId, date) {
   const cur = getCount(habitId, date);
   if (cur <= 0) return;
+  // Log the − punch for sync history, but do not reset lastUsedAt.
+  recordPunch(habitId, -1);
   setCount(habitId, date, cur - 1);
 }
 
@@ -942,6 +1053,11 @@ function renderBadHabitCard(h) {
   const avgPill = hasAvg
     ? `<span class="habit-pill avg">Avg ${avg.toFixed(1)}</span>`
     : `<span class="habit-pill avg pending">Avg pending</span>`;
+  const lastIso = getLastUsedAt(h.id);
+  const lastLabel = formatLastUsedAgo(lastIso);
+  const lastUsedHtml = lastLabel
+    ? `<div class="habit-last-used" title="${lastIso || ""}">${lastLabel}</div>`
+    : `<div class="habit-last-used never">Not used yet</div>`;
 
   const alertHtml = [
     ...warnings.map(() => `<div class="habit-warn" role="alert"></div>`),
@@ -958,6 +1074,7 @@ function renderBadHabitCard(h) {
          ${limitPill}
          ${avgPill}
        </div>
+       ${lastUsedHtml}
        ${alertHtml ? `<div class="habit-alerts">${alertHtml}</div>` : ""}
      </div>` +
     `<button class="habit-edit" title="Edit" type="button" aria-label="Edit habit">${EDIT_ICON}</button>` +
@@ -1075,15 +1192,26 @@ function counterDayTarget(h) {
   return { target: null, source: "none" };
 }
 
-/** Fraction of the local day elapsed (0–1), using hour + minute. */
-function dayProgressFraction(now) {
+/** Minutes elapsed in the local calendar day (0–1439). */
+function minutesElapsedToday(now) {
   const d = now || new Date();
-  return (d.getHours() + d.getMinutes() / 60) / 24;
+  return d.getHours() * 60 + d.getMinutes();
+}
+
+/**
+ * Expected count by now for Until-now pace: whole number proportional to day.
+ * expected = round(target × minutesElapsedToday / (24×60))
+ */
+function expectedCountByNow(target, now) {
+  if (target == null || !(target > 0)) return 0;
+  const mins = minutesElapsedToday(now);
+  return Math.round(target * mins / (24 * 60));
 }
 
 /**
  * Primary Stats viz for COUNTER habits: Today / Yesterday / 2 Days Ago
- * vs average (or daily limit), with Full day | Until now pace modes.
+ * vs full-day average (or daily limit). Until now adds a plain pace note
+ * (ahead/behind) without dual markers or fractional expected bars.
  */
 function renderTrackTillHourChart(h) {
   const { target, source } = counterDayTarget(h);
@@ -1116,38 +1244,44 @@ function renderTrackTillHourChart(h) {
     );
   }
 
-  const now = new Date();
-  const hourFrac = dayProgressFraction(now);
-  const expected = target * hourFrac;
+  const compareLabel = targetNoun === "limit" ? "limit" : "avg";
   const maxCount = rows.reduce((m, r) => Math.max(m, r.count), 0);
-  const scaleMax = Math.max(target, maxCount, untilMode ? expected : 0, 1);
-  const expectedPct = Math.min(100, (expected / scaleMax) * 100);
+  const scaleMax = Math.max(target, maxCount, 1);
 
   let rowHtml = "";
   for (const row of rows) {
-    const compareTo = row.isToday && untilMode ? expected : target;
-    const compareLabel = row.isToday && untilMode ? "expected" : targetNoun === "limit" ? "limit" : "avg";
-    const atOrOver = row.count >= compareTo;
+    // Always compare bars to the full-day avg/limit (fair, readable).
+    const atOrOver = row.count >= target;
     const tone = atOrOver ? "over" : "ok";
     const showBar = row.count > 0;
     const barPct = Math.min(100, (row.count / scaleMax) * 100);
     const fillW = showBar ? Math.max(barPct, 2.5) : 0;
-    const vals = `${row.count} used · ${compareLabel} ${formatTarget(compareTo)}`;
+    const vals = `${row.count} used · ${compareLabel} ${formatTarget(target)}`;
     rowHtml +=
-      `<div class="track-row${row.isToday ? " is-today" : ""}${untilMode && row.isToday ? " has-expected" : ""}" title="${row.date}: ${vals}">
+      `<div class="track-row${row.isToday ? " is-today" : ""}" title="${row.date}: ${vals}">
          <div class="track-label">${row.label}</div>
          <div class="track-rail-wrap">
-           ${untilMode && row.isToday
-             ? `<div class="track-expected-caption">Expected by now · ${formatTarget(expected)}</div>`
-             : ""}
            <div class="track-rail">
-             ${untilMode && row.isToday
-               ? `<div class="track-expected-mark" style="left:${expectedPct.toFixed(2)}%" aria-hidden="true"></div>`
-               : ""}
              ${showBar ? `<div class="track-fill tone-${tone}" style="width:${fillW.toFixed(2)}%"></div>` : `<div class="track-fill empty"></div>`}
            </div>
          </div>
          <div class="track-vals${atOrOver ? " over" : ""}">${vals}</div>
+       </div>`;
+  }
+
+  let paceNote = "";
+  if (untilMode) {
+    const todayCount = rows.find(r => r.isToday)?.count || 0;
+    const expected = expectedCountByNow(target);
+    const delta = todayCount - expected;
+    let paceText;
+    if (delta > 0) paceText = `Pace: ahead by ${delta}`;
+    else if (delta < 0) paceText = `Pace: behind by ${Math.abs(delta)}`;
+    else paceText = "Pace: on track";
+    paceNote =
+      `<div class="track-pace-note" title="Expected by now (rounded): ${expected} of ${formatTarget(target)}/day">
+         ${paceText}
+         <span class="track-pace-sub">· expected ~${expected} by now</span>
        </div>`;
   }
 
@@ -1166,6 +1300,7 @@ function renderTrackTillHourChart(h) {
          <span class="track-legend-item over"><i></i>At/over ${targetNoun}</span>
        </div>
        <div class="track-rows">${rowHtml}</div>
+       ${paceNote}
        ${renderMiniCountChart(h)}
      </div>`
   );
@@ -1173,7 +1308,7 @@ function renderTrackTillHourChart(h) {
 
 function formatTarget(n) {
   if (n == null || !Number.isFinite(n)) return "—";
-  return Number.isInteger(n) ? String(n) : (Math.round(n * 10) / 10).toFixed(1);
+  return String(Math.round(n));
 }
 
 /** Compact 7-day spark bars under the primary track chart (secondary). */
@@ -1516,6 +1651,12 @@ function deleteHabit() {
       if (!Object.keys(data.counts[d]).length) delete data.counts[d];
     }
   }
+  if (data.lastUsedAt && Object.prototype.hasOwnProperty.call(data.lastUsedAt, id)) {
+    delete data.lastUsedAt[id];
+  }
+  if (Array.isArray(data.punches)) {
+    data.punches = data.punches.filter(p => String(p.habitId) !== String(id));
+  }
   saveData();
   closeHabitModal();
   render();
@@ -1616,7 +1757,8 @@ function dataHasHabits(d) {
 
 /**
  * Merge local pending edits onto cloud (source of truth base):
- * lists + habits by id (cloud wins on same id), checks union, counts take max.
+ * lists + habits by id (cloud wins on same id), checks union, counts take max,
+ * lastUsedAt takes later timestamp per habit, punches union by id.
  * Returns null if merge isn't cleanly possible.
  */
 function mergeHabitData(localData, cloudData) {
@@ -1693,10 +1835,33 @@ function mergeHabitData(localData, cloudData) {
     if (Object.keys(row).length) counts[day] = row;
   }
 
+  const lastUsedAt = {};
+  const usedIds = new Set([
+    ...Object.keys(cld.lastUsedAt || {}),
+    ...Object.keys(loc.lastUsedAt || {}),
+  ]);
+  for (const id of usedIds) {
+    const later = laterIso(
+      (cld.lastUsedAt && cld.lastUsedAt[id]) || null,
+      (loc.lastUsedAt && loc.lastUsedAt[id]) || null
+    );
+    if (later) lastUsedAt[id] = later;
+  }
+
+  const punchById = new Map();
+  for (const p of [...(cld.punches || []), ...(loc.punches || [])]) {
+    if (!p || !p.id) continue;
+    const key = String(p.id);
+    if (!punchById.has(key)) punchById.set(key, p);
+  }
+  let punches = Array.from(punchById.values());
+  punches.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  if (punches.length > MAX_PUNCHES) punches = punches.slice(-MAX_PUNCHES);
+
   let activeListId = loc.activeListId || cld.activeListId || fallbackListId;
   if (!listIds.has(String(activeListId))) activeListId = fallbackListId;
 
-  return migrateData({ habits, checks, counts, lists, activeListId });
+  return migrateData({ habits, checks, counts, lastUsedAt, punches, lists, activeListId });
 }
 
 /** Load full cloud snapshot (for merge / conflict resolve). */
