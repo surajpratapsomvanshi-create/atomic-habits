@@ -783,9 +783,9 @@ function renderActiveListProgress() {
   wrap.setAttribute("aria-valuenow", String(prog.pct));
   wrap.setAttribute("aria-valuemin", "0");
   wrap.setAttribute("aria-valuemax", "100");
-  wrap.setAttribute("aria-label", `${prog.done} of ${prog.scheduled} good habits completed`);
+  wrap.setAttribute("aria-label", `${prog.pct}% complete — ${prog.done} of ${prog.scheduled} good habits`);
   fillEl.style.width = prog.pct + "%";
-  metaEl.textContent = prog.done + "/" + prog.scheduled;
+  metaEl.textContent = prog.pct + "%";
 }
 
 function renderSettingsLists() {
