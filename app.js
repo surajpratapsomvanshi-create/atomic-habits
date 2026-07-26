@@ -715,7 +715,6 @@ function completionRate(habitId) {
 
 /* ---------------- rendering ---------------- */
 function render() {
-  renderHeader();
   renderListTabs();
   renderDateStrip();
   renderHabits();
@@ -735,26 +734,17 @@ function renderListTabs() {
   if (!tabsEl) return;
   const lists = sortedLists();
   const activeId = getActiveListId();
-  const date = selectedDate;
   tabsEl.innerHTML = "";
   for (const list of lists) {
     const count = countHabitsInList(list.id);
-    const prog = listGoodProgress(list.id, date);
     const isActive = String(list.id) === activeId;
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "list-tab" + (isActive ? " active" : "");
-    if (prog.scheduled > 0) {
-      btn.classList.add("has-progress");
-      if (prog.done >= prog.scheduled) btn.classList.add("progress-complete");
-    }
     btn.setAttribute("role", "tab");
     btn.setAttribute("aria-selected", isActive ? "true" : "false");
     btn.dataset.listId = list.id;
-    if (prog.scheduled > 0) {
-      btn.title = `${prog.done} of ${prog.scheduled} good habits done`;
-      btn.setAttribute("aria-label", `${list.name}, ${prog.done} of ${prog.scheduled} good habits done`);
-    }
+    btn.setAttribute("aria-label", list.name);
     const nameSpan = document.createElement("span");
     nameSpan.className = "list-tab-name";
     nameSpan.textContent = list.name;
@@ -764,16 +754,6 @@ function renderListTabs() {
       badge.className = "list-tab-badge";
       badge.textContent = String(count);
       btn.appendChild(badge);
-    }
-    if (prog.scheduled > 0) {
-      const track = document.createElement("span");
-      track.className = "list-tab-progress";
-      track.setAttribute("aria-hidden", "true");
-      const fill = document.createElement("span");
-      fill.className = "list-tab-progress-fill";
-      fill.style.width = prog.pct + "%";
-      track.appendChild(fill);
-      btn.appendChild(track);
     }
     btn.addEventListener("click", () => setActiveList(list.id));
     tabsEl.appendChild(btn);
@@ -828,22 +808,6 @@ function renderSettingsLists() {
     row.querySelector('[data-act="rename"]').onclick = () => promptRenameList(list.id);
     row.querySelector('[data-act="delete"]').onclick = () => deleteList(list.id);
     el.appendChild(row);
-  }
-}
-
-function renderHeader() {
-  const titleEl = document.getElementById("header-title");
-  const dateEl = document.getElementById("header-date");
-  if (currentView === "today") {
-    titleEl.textContent = "Habits";
-    const isToday = selectedDate === todayStr();
-    dateEl.textContent = isToday ? prettyDate(selectedDate) : prettyDate(selectedDate);
-  } else if (currentView === "stats") {
-    titleEl.textContent = "Stats";
-    dateEl.textContent = getActiveList().name;
-  } else if (currentView === "settings") {
-    titleEl.textContent = "Settings";
-    dateEl.textContent = "Suraj Pratap’s Atomic Habits";
   }
 }
 
@@ -2238,7 +2202,6 @@ function switchView(name) {
     b.classList.toggle("active", b.dataset.view === name));
   const tabsWrap = document.getElementById("list-tabs-wrap");
   if (tabsWrap) tabsWrap.classList.toggle("hidden", name === "settings");
-  renderHeader();
   updateFabVisibility();
   if (name === "settings") renderSettingsLists();
 }
