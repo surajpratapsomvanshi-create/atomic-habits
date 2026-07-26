@@ -2,19 +2,22 @@
    Atomic Habits Tracker — offline-first, syncs to Google Sheets
    Data model (localStorage "ah.data"):
    {
+     lists: [{ id, name, sortIndex, createdAt }],
+     activeListId: string,
      habits: [{
-       id, name, emoji, color, createdAt, archived,
+       id, name, emoji, color, createdAt, archived, listId,
        type: "good" | "bad",
        schedule: { kind: "daily" } |
                  { kind: "weekdays", weekdays: [0-6] } |
                  { kind: "once", date: "YYYY-MM-DD" },
        dailyLimit: number | null,  // bad habits only
-       sortIndex: number           // display order (Today + Stats)
+       sortIndex: number           // display order within list
      }],
      checks: { "YYYY-MM-DD": ["habitId", ...] },   // good habits
      counts: { "YYYY-MM-DD": { habitId: number } } // bad habits
    }
-   Legacy habits without type/schedule migrate to daily good habits.
+   Legacy habits without type/schedule/listId migrate to daily good habits
+   on a default "Atomic Habits" list.
    ===================================================================== */
 
 const LS_DATA = "ah.data";
@@ -27,9 +30,11 @@ const DEFAULT_SCRIPT_URL =
 /** Default poll interval when auto-refresh is on. */
 const DEFAULT_POLL_MS = 45000;
 const POLL_EDIT_DEBOUNCE_MS = 2500;
+const DEFAULT_LIST_ID = "list-default";
+const DEFAULT_LIST_NAME = "Atomic Habits";
 
 const EMOJIS = ["🦷","💧","🏃","📖","🧘","💪","😴","🥗","✍️","🚭","🧹","💊","🌞","🎸","💻","🙏"];
-const COLORS = ["#5b8def","#3ecf8e","#e8b84a","#f07178","#a78bfa","#f472b6","#22d3ee","#fb923c"];
+const COLORS = ["#8ab4f8","#81c995","#fdd663","#f28b82","#a78bfa","#f472b6","#22d3ee","#fb923c"];
 const DOW_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MIN_AVG_HISTORY_DAYS = 1;
 const EDIT_ICON =
@@ -51,6 +56,8 @@ let modalScheduleKind = "daily";
 let modalWeekdays = [1, 3, 5];
 let modalOnceDate = todayStr();
 let modalDailyLimit = "";
+/** Target list for new/edited habit (Move to…). */
+let modalListId = null;
 /** Bad-habit Stats compare mode: full-day average vs pace-until-now. */
 let counterPaceMode = "full"; // "full" | "until"
 let syncTimer = null;
@@ -108,22 +115,76 @@ function loadSettings() {
 function saveData() { localStorage.setItem(LS_DATA, JSON.stringify(data)); }
 function saveSettings() { localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)); }
 
-/** Normalize legacy payloads so old habits behave as daily good habits. */
+function makeDefaultList(createdAt) {
+  return {
+    id: DEFAULT_LIST_ID,
+    name: DEFAULT_LIST_NAME,
+    sortIndex: 0,
+    createdAt: createdAt || (typeof todayStr === "function" ? todayStr() : new Date().toISOString().slice(0, 10)),
+  };
+}
+
+function migrateList(l, index) {
+  if (!l || typeof l !== "object") return null;
+  const sortRaw = l.sortIndex != null ? Number(l.sortIndex) : NaN;
+  return {
+    id: String(l.id || ("list-" + Date.now().toString(36) + index)),
+    name: String(l.name || "List").trim() || "List",
+    sortIndex: Number.isFinite(sortRaw) ? sortRaw : index,
+    createdAt: l.createdAt || todayStr(),
+  };
+}
+
+/** Normalize legacy payloads so old habits behave as daily good habits on a default list. */
 function migrateData(raw) {
-  if (!raw || typeof raw !== "object") return { habits: [], checks: {}, counts: {} };
-  const habits = Array.isArray(raw.habits) ? raw.habits.map(migrateHabit) : [];
-  // Existing habits without sortIndex inherit current array order.
+  if (!raw || typeof raw !== "object") {
+    const list = makeDefaultList();
+    return { habits: [], checks: {}, counts: {}, lists: [list], activeListId: list.id };
+  }
+
+  let lists = Array.isArray(raw.lists)
+    ? raw.lists.map(migrateList).filter(Boolean)
+    : [];
+  if (!lists.length) lists = [makeDefaultList(raw.habits && raw.habits[0] && raw.habits[0].createdAt)];
+  lists.sort((a, b) => (a.sortIndex - b.sortIndex) || String(a.id).localeCompare(String(b.id)));
+  lists.forEach((l, i) => { l.sortIndex = i; });
+
+  const listIds = new Set(lists.map(l => String(l.id)));
+  const fallbackListId = lists[0].id;
+
+  const habits = Array.isArray(raw.habits)
+    ? raw.habits.map(h => migrateHabit(h, fallbackListId, listIds))
+    : [];
+  // Existing habits without sortIndex inherit current array order (per list later).
   habits.forEach((h, i) => {
     if (h && (h.sortIndex == null || !Number.isFinite(Number(h.sortIndex)))) h.sortIndex = i;
   });
-  habits.sort((a, b) => (a.sortIndex - b.sortIndex) || String(a.id).localeCompare(String(b.id)));
-  habits.forEach((h, i) => { h.sortIndex = i; });
+  // Normalize sortIndex within each list while preserving relative order.
+  const byList = new Map();
+  for (const h of habits) {
+    const lid = String(h.listId || fallbackListId);
+    if (!byList.has(lid)) byList.set(lid, []);
+    byList.get(lid).push(h);
+  }
+  for (const group of byList.values()) {
+    group.sort((a, b) => (a.sortIndex - b.sortIndex) || String(a.id).localeCompare(String(b.id)));
+    group.forEach((h, i) => { h.sortIndex = i; });
+  }
+  habits.sort((a, b) => {
+    const la = String(a.listId || "");
+    const lb = String(b.listId || "");
+    if (la !== lb) return la.localeCompare(lb);
+    return (a.sortIndex - b.sortIndex) || String(a.id).localeCompare(String(b.id));
+  });
+
   const checks = raw.checks && typeof raw.checks === "object" ? raw.checks : {};
   const counts = raw.counts && typeof raw.counts === "object" ? raw.counts : {};
-  return { habits, checks, counts };
+  let activeListId = raw.activeListId != null ? String(raw.activeListId) : fallbackListId;
+  if (!listIds.has(activeListId)) activeListId = fallbackListId;
+  return { habits, checks, counts, lists, activeListId };
 }
 
-function migrateHabit(h) {
+function migrateHabit(h, fallbackListId, listIds) {
   if (!h || typeof h !== "object") return h;
   const type = h.type === "bad" ? "bad" : "good";
   let schedule = h.schedule;
@@ -145,6 +206,8 @@ function migrateHabit(h) {
     if (Number.isFinite(n) && n >= 0) dailyLimit = Math.floor(n);
   }
   const sortRaw = h.sortIndex != null ? Number(h.sortIndex) : NaN;
+  let listId = h.listId != null ? String(h.listId) : fallbackListId;
+  if (listIds && !listIds.has(listId)) listId = fallbackListId;
   return {
     id: h.id,
     name: h.name || "Habit",
@@ -152,6 +215,7 @@ function migrateHabit(h) {
     color: h.color || COLORS[0],
     createdAt: h.createdAt || todayStr(),
     archived: !!h.archived,
+    listId,
     type,
     schedule,
     dailyLimit,
@@ -178,21 +242,172 @@ function weekdayOf(str) {
   return new Date(y, m - 1, d).getDay();
 }
 
+/* ---------------- lists ---------------- */
+function sortedLists() {
+  return (data.lists || [])
+    .slice()
+    .sort((a, b) => (a.sortIndex - b.sortIndex) || String(a.id).localeCompare(String(b.id)));
+}
+
+function getActiveListId() {
+  const id = data.activeListId;
+  if (id && (data.lists || []).some(l => String(l.id) === String(id))) return String(id);
+  const first = sortedLists()[0];
+  return first ? String(first.id) : DEFAULT_LIST_ID;
+}
+
+function getActiveList() {
+  const id = getActiveListId();
+  return (data.lists || []).find(l => String(l.id) === id) || sortedLists()[0] || makeDefaultList();
+}
+
+function setActiveList(listId) {
+  if (!(data.lists || []).some(l => String(l.id) === String(listId))) return;
+  data.activeListId = String(listId);
+  saveData();
+  render();
+}
+
+function countHabitsInList(listId) {
+  return (data.habits || []).filter(h => !h.archived && String(h.listId) === String(listId)).length;
+}
+
+function nextListSortIndex() {
+  let max = -1;
+  for (const l of data.lists || []) {
+    const n = Number(l.sortIndex);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return max + 1;
+}
+
+function createList(name) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) { toast("Give your list a name"); return null; }
+  const list = {
+    id: "list-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+    name: trimmed,
+    sortIndex: nextListSortIndex(),
+    createdAt: todayStr(),
+  };
+  data.lists = sortedLists().concat([list]);
+  data.activeListId = list.id;
+  saveData();
+  queueSync();
+  render();
+  toast("List created");
+  return list;
+}
+
+function renameList(listId, name) {
+  const list = (data.lists || []).find(l => String(l.id) === String(listId));
+  if (!list) return false;
+  const trimmed = String(name || "").trim();
+  if (!trimmed) { toast("Give your list a name"); return false; }
+  list.name = trimmed;
+  saveData();
+  queueSync();
+  render();
+  return true;
+}
+
+function deleteList(listId) {
+  const lists = sortedLists();
+  if (lists.length <= 1) {
+    toast("Keep at least one list");
+    return false;
+  }
+  const id = String(listId);
+  const list = lists.find(l => String(l.id) === id);
+  if (!list) return false;
+  const habitCount = countHabitsInList(id);
+  if (habitCount > 0) {
+    if (!confirm(`Delete "${list.name}" and its ${habitCount} habit${habitCount === 1 ? "" : "s"}?`)) {
+      return false;
+    }
+  } else if (!confirm(`Delete list "${list.name}"?`)) {
+    return false;
+  }
+
+  const habitIds = new Set(
+    (data.habits || []).filter(h => String(h.listId) === id).map(h => String(h.id))
+  );
+  data.habits = (data.habits || []).filter(h => String(h.listId) !== id);
+  for (const d of Object.keys(data.checks || {})) {
+    data.checks[d] = (data.checks[d] || []).filter(x => !habitIds.has(String(x)));
+    if (!data.checks[d].length) delete data.checks[d];
+  }
+  for (const d of Object.keys(data.counts || {})) {
+    if (!data.counts[d]) continue;
+    for (const hid of habitIds) delete data.counts[d][hid];
+    if (!Object.keys(data.counts[d]).length) delete data.counts[d];
+  }
+  data.lists = lists.filter(l => String(l.id) !== id);
+  data.lists.forEach((l, i) => { l.sortIndex = i; });
+  if (String(data.activeListId) === id) {
+    data.activeListId = data.lists[0].id;
+  }
+  saveData();
+  queueSync();
+  render();
+  toast("List deleted");
+  return true;
+}
+
+function promptCreateList() {
+  const name = prompt("New list name", "My Habits");
+  if (name == null) return;
+  createList(name);
+}
+
+function promptRenameList(listId) {
+  const list = (data.lists || []).find(l => String(l.id) === String(listId || getActiveListId()));
+  if (!list) return;
+  const name = prompt("Rename list", list.name);
+  if (name == null) return;
+  renameList(list.id, name);
+}
+
 /* ---------------- schedule / habit helpers ---------------- */
 function activeHabits() {
+  const listId = getActiveListId();
   return data.habits
-    .filter(h => !h.archived)
+    .filter(h => !h.archived && String(h.listId) === listId)
     .slice()
     .sort((a, b) => (a.sortIndex - b.sortIndex) || String(a.id).localeCompare(String(b.id)));
 }
 
 function nextSortIndex() {
+  return nextSortIndexForList(getActiveListId());
+}
+
+function nextSortIndexForList(listId) {
+  const lid = String(listId);
   let max = -1;
   for (const h of data.habits) {
+    if (String(h.listId) !== lid) continue;
     const n = Number(h.sortIndex);
     if (Number.isFinite(n) && n > max) max = n;
   }
   return max + 1;
+}
+
+/**
+ * Move a habit to another list. Updates listId + sortIndex, persists, syncs.
+ * Returns true if moved.
+ */
+function moveHabitToList(habitId, targetListId) {
+  const h = data.habits.find(x => String(x.id) === String(habitId));
+  if (!h) return false;
+  const target = String(targetListId);
+  if (!(data.lists || []).some(l => String(l.id) === target)) return false;
+  if (String(h.listId) === target) return false;
+  h.listId = target;
+  h.sortIndex = nextSortIndexForList(target);
+  saveData();
+  queueSync();
+  render();
+  return true;
 }
 
 /**
@@ -242,9 +457,6 @@ function applyVisibleHabitOrder(orderedVisibleIds) {
   }
 
   reordered.forEach((h, i) => { h.sortIndex = i; });
-  const archived = data.habits.filter(h => h.archived);
-  archived.forEach((h, i) => { h.sortIndex = reordered.length + i; });
-  data.habits = [...reordered, ...archived];
   saveData();
   queueSync();
   render();
@@ -481,33 +693,90 @@ function completionRate(habitId) {
 /* ---------------- rendering ---------------- */
 function render() {
   renderHeader();
+  renderListTabs();
   renderDateStrip();
   renderHabits();
   renderStats();
+  renderSettingsLists();
+  updateFabVisibility();
 }
 
-/** Time-of-day greeting for the personalized header. */
-function greeting() {
-  const hr = new Date().getHours();
-  if (hr < 5) return "Burning the midnight oil, Suraj";
-  if (hr < 12) return "Good morning, Suraj";
-  if (hr < 17) return "Good afternoon, Suraj";
-  return "Good evening, Suraj";
+function updateFabVisibility() {
+  const app = document.getElementById("app");
+  if (!app) return;
+  app.classList.toggle("view-settings", currentView === "settings");
+}
+
+function renderListTabs() {
+  const tabsEl = document.getElementById("list-tabs");
+  if (!tabsEl) return;
+  const lists = sortedLists();
+  const activeId = getActiveListId();
+  tabsEl.innerHTML = "";
+  for (const list of lists) {
+    const count = countHabitsInList(list.id);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "list-tab" + (String(list.id) === activeId ? " active" : "");
+    btn.setAttribute("role", "tab");
+    btn.setAttribute("aria-selected", String(list.id) === activeId ? "true" : "false");
+    btn.dataset.listId = list.id;
+    const nameSpan = document.createElement("span");
+    nameSpan.className = "list-tab-name";
+    nameSpan.textContent = list.name;
+    btn.appendChild(nameSpan);
+    if (String(list.id) !== activeId && count > 0) {
+      const badge = document.createElement("span");
+      badge.className = "list-tab-badge";
+      badge.textContent = String(count);
+      btn.appendChild(badge);
+    }
+    btn.addEventListener("click", () => setActiveList(list.id));
+    tabsEl.appendChild(btn);
+  }
+
+  const active = getActiveList();
+  const titleEl = document.getElementById("active-list-title");
+  if (titleEl) titleEl.textContent = active ? active.name : DEFAULT_LIST_NAME;
+  const statsTitle = document.getElementById("stats-list-title");
+  if (statsTitle) statsTitle.textContent = (active ? active.name : "Habits") + " · Stats";
+}
+
+function renderSettingsLists() {
+  const el = document.getElementById("settings-lists");
+  if (!el) return;
+  el.innerHTML = "";
+  for (const list of sortedLists()) {
+    const row = document.createElement("div");
+    row.className = "settings-list-row";
+    const count = countHabitsInList(list.id);
+    row.innerHTML =
+      `<div class="name"></div>` +
+      `<div class="count"></div>` +
+      `<button type="button" class="mini-btn" data-act="rename">Rename</button>` +
+      `<button type="button" class="mini-btn danger" data-act="delete">Delete</button>`;
+    row.querySelector(".name").textContent = list.name;
+    row.querySelector(".count").textContent = count + " habit" + (count === 1 ? "" : "s");
+    row.querySelector('[data-act="rename"]').onclick = () => promptRenameList(list.id);
+    row.querySelector('[data-act="delete"]').onclick = () => deleteList(list.id);
+    el.appendChild(row);
+  }
 }
 
 function renderHeader() {
+  const titleEl = document.getElementById("header-title");
+  const dateEl = document.getElementById("header-date");
   if (currentView === "today") {
+    titleEl.textContent = "Habits";
     const isToday = selectedDate === todayStr();
-    document.getElementById("header-title").textContent = isToday ? greeting() : prettyDate(selectedDate).split(",")[0];
-    document.getElementById("header-date").textContent = prettyDate(selectedDate);
+    dateEl.textContent = isToday ? prettyDate(selectedDate) : prettyDate(selectedDate);
+  } else if (currentView === "stats") {
+    titleEl.textContent = "Stats";
+    dateEl.textContent = getActiveList().name;
+  } else if (currentView === "settings") {
+    titleEl.textContent = "Settings";
+    dateEl.textContent = "Suraj Pratap’s Atomic Habits";
   }
-
-  const goods = goodHabitsForDate(selectedDate); // counters never affect the ring
-  const done = goods.filter(h => isChecked(h.id, selectedDate)).length;
-  const pct = goods.length ? Math.round((done / goods.length) * 100) : 0;
-  const C = 2 * Math.PI * 19;
-  document.getElementById("day-ring").style.strokeDashoffset = C * (1 - pct / 100);
-  document.getElementById("day-ring-label").textContent = pct + "%";
 }
 
 function renderDateStrip() {
@@ -556,19 +825,19 @@ function renderHabits() {
   const listEl = document.getElementById("habit-list");
   const emptyEl = document.getElementById("empty-state");
   const habits = habitsForDate(selectedDate);
-  const anyActive = activeHabits().length > 0;
+  const anyInList = activeHabits().length > 0;
   listEl.innerHTML = "";
 
   if (!habits.length) {
     emptyEl.classList.remove("hidden");
-    if (anyActive) {
-      emptyEl.querySelector(".empty-emoji").textContent = "📅";
-      emptyEl.querySelector("h2").textContent = "Nothing scheduled";
-      emptyEl.querySelector("p").innerHTML = "No habits are scheduled for this day.<br/>Add one or pick another date.";
+    const h2 = emptyEl.querySelector("h2");
+    const p = emptyEl.querySelector("p");
+    if (anyInList) {
+      h2.textContent = "Nothing scheduled";
+      p.textContent = "No habits are scheduled for this day. Add one or pick another date.";
     } else {
-      emptyEl.querySelector(".empty-emoji").textContent = "🌱";
-      emptyEl.querySelector("h2").textContent = "No habits yet";
-      emptyEl.querySelector("p").innerHTML = "Small habits, remarkable results.<br/>Add your first habit to get started.";
+      h2.textContent = "No habits yet";
+      p.textContent = "Add a habit to this list to start tracking.";
     }
     return;
   }
@@ -1039,6 +1308,7 @@ function openHabitModal(habitId) {
     : [1, 3, 5];
   modalOnceDate = s.kind === "once" && s.date ? s.date : todayStr();
   modalDailyLimit = h && h.dailyLimit != null ? String(h.dailyLimit) : "";
+  modalListId = h && h.listId ? String(h.listId) : getActiveListId();
 
   renderPickers();
   syncModalSections();
@@ -1063,6 +1333,29 @@ function syncModalSections() {
   document.getElementById("habit-daily-limit").value = modalDailyLimit;
   document.getElementById("habit-name").placeholder =
     modalType === "bad" ? "e.g. Cigarettes" : "e.g. Brush teeth";
+
+  const listSelect = document.getElementById("habit-list-select");
+  const listHint = document.getElementById("habit-list-hint");
+  if (listSelect) {
+    const lists = sortedLists();
+    const selected = modalListId && lists.some(l => String(l.id) === String(modalListId))
+      ? String(modalListId)
+      : getActiveListId();
+    modalListId = selected;
+    listSelect.innerHTML = "";
+    for (const list of lists) {
+      const opt = document.createElement("option");
+      opt.value = list.id;
+      opt.textContent = list.name;
+      if (String(list.id) === selected) opt.selected = true;
+      listSelect.appendChild(opt);
+    }
+  }
+  if (listHint) {
+    listHint.textContent = editingHabitId
+      ? "Change the list to move this habit."
+      : "New habits go into the selected list.";
+  }
 
   const wp = document.getElementById("weekday-picker");
   wp.innerHTML = "";
@@ -1135,6 +1428,14 @@ function saveHabit() {
     }
   }
   const schedule = buildScheduleFromModal();
+  const listSelectEl = document.getElementById("habit-list-select");
+  const chosenListId = (listSelectEl && listSelectEl.value)
+    || modalListId
+    || getActiveListId();
+  if (!(data.lists || []).some(l => String(l.id) === String(chosenListId))) {
+    toast("Pick a valid list");
+    return;
+  }
   const fields = {
     name,
     emoji: modalEmoji,
@@ -1145,15 +1446,25 @@ function saveHabit() {
   };
   if (editingHabitId) {
     const h = data.habits.find(x => x.id === editingHabitId);
+    const prevList = String(h.listId);
     Object.assign(h, fields);
+    if (prevList !== String(chosenListId)) {
+      h.listId = String(chosenListId);
+      h.sortIndex = nextSortIndexForList(chosenListId);
+    }
   } else {
     data.habits.push({
       id: "h" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       ...fields,
+      listId: String(chosenListId),
       createdAt: todayStr(),
       archived: false,
-      sortIndex: nextSortIndex(),
+      sortIndex: nextSortIndexForList(chosenListId),
     });
+    // Switch to the list where the habit was created if different.
+    if (String(data.activeListId) !== String(chosenListId)) {
+      data.activeListId = String(chosenListId);
+    }
   }
   saveData();
   closeHabitModal();
@@ -1275,7 +1586,7 @@ function dataHasHabits(d) {
 
 /**
  * Merge local pending edits onto cloud (source of truth base):
- * habits by id (local fields win on same id), checks union, counts take max.
+ * lists + habits by id (cloud wins on same id), checks union, counts take max.
  * Returns null if merge isn't cleanly possible.
  */
 function mergeHabitData(localData, cloudData) {
@@ -1284,6 +1595,25 @@ function mergeHabitData(localData, cloudData) {
   const loc = migrateData(localData);
   const cld = migrateData(cloudData);
   if (!dataHasHabits(cld)) return null;
+
+  const listsById = new Map();
+  for (const l of cld.lists || []) {
+    if (l && l.id != null) listsById.set(String(l.id), Object.assign({}, l));
+  }
+  for (const l of loc.lists || []) {
+    if (!l || l.id == null) continue;
+    const id = String(l.id);
+    if (listsById.has(id)) continue; // same id → keep cloud
+    listsById.set(id, Object.assign({}, l));
+  }
+  // Ensure at least one list.
+  if (!listsById.size) {
+    const def = makeDefaultList();
+    listsById.set(def.id, def);
+  }
+  const lists = Array.from(listsById.values());
+  const listIds = new Set(lists.map(l => String(l.id)));
+  const fallbackListId = lists[0].id;
 
   const byId = new Map();
   // Cloud first (source of truth). Local-only habit ids are added; same-id keeps cloud fields.
@@ -1298,7 +1628,11 @@ function mergeHabitData(localData, cloudData) {
     if (byId.has(id)) continue; // same id → keep cloud
     byId.set(id, Object.assign({}, h));
   }
-  const habits = Array.from(byId.values());
+  const habits = Array.from(byId.values()).map(h => {
+    let listId = h.listId != null ? String(h.listId) : fallbackListId;
+    if (!listIds.has(listId)) listId = fallbackListId;
+    return Object.assign({}, h, { listId });
+  });
 
   const checks = {};
   const checkDates = new Set([
@@ -1329,7 +1663,10 @@ function mergeHabitData(localData, cloudData) {
     if (Object.keys(row).length) counts[day] = row;
   }
 
-  return migrateData({ habits, checks, counts });
+  let activeListId = loc.activeListId || cld.activeListId || fallbackListId;
+  if (!listIds.has(String(activeListId))) activeListId = fallbackListId;
+
+  return migrateData({ habits, checks, counts, lists, activeListId });
 }
 
 /** Load full cloud snapshot (for merge / conflict resolve). */
@@ -1801,6 +2138,8 @@ function importJson(file) {
         habits: parsed.habits,
         checks: parsed.checks || {},
         counts: parsed.counts || {},
+        lists: parsed.lists,
+        activeListId: parsed.activeListId,
       });
       saveData();
       render();
@@ -1829,13 +2168,11 @@ function switchView(name) {
   document.getElementById("view-" + name).classList.add("active");
   document.querySelectorAll(".nav-btn[data-view]").forEach(b =>
     b.classList.toggle("active", b.dataset.view === name));
-  const titles = { today: null, stats: "Statistics", settings: "Settings" };
-  if (titles[name]) {
-    document.getElementById("header-title").textContent = titles[name];
-    document.getElementById("header-date").textContent = "";
-  } else {
-    renderHeader();
-  }
+  const tabsWrap = document.getElementById("list-tabs-wrap");
+  if (tabsWrap) tabsWrap.classList.toggle("hidden", name === "settings");
+  renderHeader();
+  updateFabVisibility();
+  if (name === "settings") renderSettingsLists();
 }
 
 /* ---------------- wire up ---------------- */
@@ -1917,7 +2254,7 @@ document.getElementById("import-file").addEventListener("change", e => {
 });
 document.getElementById("btn-reset").addEventListener("click", () => {
   if (confirm("Delete ALL local habits and history? (The Google Sheet is not touched.)")) {
-    data = { habits: [], checks: {}, counts: {} };
+    data = migrateData({ habits: [], checks: {}, counts: {}, lists: [] });
     saveData();
     // Blank local state must not auto-overwrite the cloud afterwards.
     autoSyncArmed = false;
@@ -1949,10 +2286,13 @@ document.addEventListener("visibilitychange", onVisibilityForPoll);
 if (!localStorage.getItem(LS_DATA)) {
   // Seed createdAt a month back so the current week is never empty for new users
   const seedCreated = addDays(todayStr(), -30);
+  const defaultList = makeDefaultList(seedCreated);
+  data.lists = [defaultList];
+  data.activeListId = defaultList.id;
   data.habits = [
-    { id: "h-seed1", name: "Brush teeth", emoji: "🦷", color: COLORS[0], createdAt: seedCreated, archived: false, type: "good", schedule: { kind: "daily" }, dailyLimit: null, sortIndex: 0 },
-    { id: "h-seed2", name: "Drink water", emoji: "💧", color: COLORS[6], createdAt: seedCreated, archived: false, type: "good", schedule: { kind: "daily" }, dailyLimit: null, sortIndex: 1 },
-    { id: "h-seed3", name: "Read 10 minutes", emoji: "📖", color: COLORS[2], createdAt: seedCreated, archived: false, type: "good", schedule: { kind: "daily" }, dailyLimit: null, sortIndex: 2 },
+    { id: "h-seed1", name: "Brush teeth", emoji: "🦷", color: COLORS[0], createdAt: seedCreated, archived: false, listId: defaultList.id, type: "good", schedule: { kind: "daily" }, dailyLimit: null, sortIndex: 0 },
+    { id: "h-seed2", name: "Drink water", emoji: "💧", color: COLORS[6], createdAt: seedCreated, archived: false, listId: defaultList.id, type: "good", schedule: { kind: "daily" }, dailyLimit: null, sortIndex: 1 },
+    { id: "h-seed3", name: "Read 10 minutes", emoji: "📖", color: COLORS[2], createdAt: seedCreated, archived: false, listId: defaultList.id, type: "good", schedule: { kind: "daily" }, dailyLimit: null, sortIndex: 2 },
   ];
   data.checks = {};
   data.counts = {};
@@ -1974,6 +2314,68 @@ document.getElementById("date-picker").addEventListener("change", e => {
   if (e.target.value) pickDate(e.target.value);
 });
 
+/* ---------------- list menu ---------------- */
+function closeListMenu() {
+  const backdrop = document.getElementById("list-menu-backdrop");
+  if (backdrop) backdrop.classList.add("hidden");
+  const btn = document.getElementById("btn-list-menu");
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+function openListMenu() {
+  const backdrop = document.getElementById("list-menu-backdrop");
+  const menu = document.getElementById("list-menu");
+  const btn = document.getElementById("btn-list-menu");
+  if (!backdrop || !menu || !btn) return;
+  const rect = btn.getBoundingClientRect();
+  menu.style.top = Math.min(window.innerHeight - 160, rect.bottom + 6) + "px";
+  menu.style.right = Math.max(8, window.innerWidth - rect.right) + "px";
+  menu.style.left = "auto";
+  backdrop.classList.remove("hidden");
+  btn.setAttribute("aria-expanded", "true");
+}
+const listMenuBtn = document.getElementById("btn-list-menu");
+if (listMenuBtn) {
+  listMenuBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const backdrop = document.getElementById("list-menu-backdrop");
+    if (backdrop && !backdrop.classList.contains("hidden")) closeListMenu();
+    else openListMenu();
+  });
+}
+const listMenuBackdrop = document.getElementById("list-menu-backdrop");
+if (listMenuBackdrop) {
+  listMenuBackdrop.addEventListener("click", (e) => {
+    if (e.target.id === "list-menu-backdrop") closeListMenu();
+  });
+}
+document.querySelectorAll("[data-list-action]").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const action = btn.dataset.listAction;
+    closeListMenu();
+    if (action === "rename") promptRenameList(getActiveListId());
+    else if (action === "create") promptCreateList();
+    else if (action === "delete") deleteList(getActiveListId());
+  });
+});
+const btnNewListSettings = document.getElementById("btn-new-list-settings");
+if (btnNewListSettings) btnNewListSettings.addEventListener("click", promptCreateList);
+const btnTabNewList = document.getElementById("btn-tab-new-list");
+if (btnTabNewList) btnTabNewList.addEventListener("click", promptCreateList);
+const habitListSelect = document.getElementById("habit-list-select");
+if (habitListSelect) {
+  habitListSelect.addEventListener("change", (e) => {
+    modalListId = e.target.value || getActiveListId();
+  });
+}
+const btnSortHint = document.getElementById("btn-sort-hint");
+if (btnSortHint) {
+  btnSortHint.addEventListener("click", () => toast("My order — drag habits to rearrange"));
+}
+const avatarBtn = document.getElementById("avatar-btn");
+if (avatarBtn) {
+  avatarBtn.addEventListener("click", () => toast("Suraj Pratap’s Atomic Habits"));
+}
+
 render();
 
 // Establish cloud state before auto-sync may fire (fail-safe for new devices).
@@ -1986,6 +2388,12 @@ try {
     getPollState: () => ({ pollTimer, nextPollAt, localDirty, autoSyncArmed, lastSeenRevision: settings.lastSeenRevision }),
     markDirty: () => { localDirty = true; },
     mergeHabitData,
+    migrateData,
+    createList,
+    renameList,
+    deleteList,
+    moveHabitToList,
+    getActiveListId,
   };
 } catch (e) { /* non-browser */ }
 

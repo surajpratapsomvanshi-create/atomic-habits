@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <meta name="theme-color" content="#0b0d12" />
+  <meta name="theme-color" content="#1f1f1f" />
   <title>Suraj Pratap's Atomic Habits</title>
   <link rel="manifest" href="manifest.webmanifest" />
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
@@ -13,30 +13,26 @@
 <body>
   <div id="app">
 
-    <!-- ============ HEADER ============ -->
+    <!-- ============ HEADER (Google Tasks–style) ============ -->
     <header class="app-header">
-      <div>
-        <p class="header-brand">Suraj Pratap’s Atomic Habits</p>
-        <h1 id="header-title">Today</h1>
+      <div class="header-spacer" aria-hidden="true"></div>
+      <div class="header-center">
+        <h1 id="header-title">Habits</h1>
         <p class="header-date" id="header-date"></p>
       </div>
       <div class="header-right">
         <span id="sync-indicator" class="sync-indicator" title="Sync status" aria-label="Sync status">●</span>
-        <div class="day-progress-ring" title="Today’s completion">
-          <svg viewBox="0 0 44 44" width="42" height="42" aria-hidden="true">
-            <defs>
-              <linearGradient id="ring-grad" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0%" stop-color="#3ecf8e"/>
-                <stop offset="100%" stop-color="#5b8def"/>
-              </linearGradient>
-            </defs>
-            <circle class="ring-bg" cx="22" cy="22" r="19"></circle>
-            <circle class="ring-fill" id="day-ring" cx="22" cy="22" r="19"></circle>
-          </svg>
-          <span id="day-ring-label">0%</span>
-        </div>
+        <button type="button" class="avatar-btn" id="avatar-btn" title="Suraj Pratap" aria-label="Suraj Pratap">S</button>
       </div>
     </header>
+
+    <!-- ============ LIST TABS ============ -->
+    <div class="list-tabs-wrap" id="list-tabs-wrap">
+      <div class="list-tabs" id="list-tabs" role="tablist" aria-label="Habit lists"></div>
+      <button type="button" class="list-tab-add" id="btn-tab-new-list" title="Create new list" aria-label="Create new list">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </div>
 
     <!-- ============ TODAY VIEW ============ -->
     <main id="view-today" class="view active">
@@ -53,23 +49,58 @@
         </button>
         <input type="date" id="date-picker" class="date-picker-input" aria-label="Choose date" tabindex="-1" />
       </div>
-      <div id="habit-list" class="habit-list"></div>
-      <div id="empty-state" class="empty-state hidden">
-        <div class="empty-emoji">🌱</div>
-        <h2>No habits yet</h2>
-        <p>Small habits, remarkable results.<br/>Add your first habit to get started.</p>
-        <button class="btn btn-primary" onclick="openHabitModal()">Add a habit</button>
-      </div>
+
+      <section class="tasks-card" aria-label="Habit list">
+        <div class="tasks-card-head">
+          <h2 class="tasks-card-title" id="active-list-title">Atomic Habits</h2>
+          <div class="tasks-card-actions">
+            <button type="button" class="icon-btn" id="btn-sort-hint" title="My order" aria-label="Sort: My order">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h12M3 12h8M3 18h5" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/><path d="M17 8l3 3-3 3M20 11H11" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button type="button" class="icon-btn" id="btn-list-menu" title="List options" aria-label="List options" aria-haspopup="menu" aria-expanded="false">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="1.6" fill="currentColor"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/><circle cx="12" cy="19" r="1.6" fill="currentColor"/></svg>
+            </button>
+          </div>
+        </div>
+        <div id="habit-list" class="habit-list"></div>
+        <div id="empty-state" class="empty-state hidden">
+          <div class="empty-art" aria-hidden="true">
+            <svg viewBox="0 0 120 88" width="120" height="88">
+              <rect x="18" y="14" width="84" height="60" rx="10" fill="#3c4043"/>
+              <rect x="28" y="26" width="44" height="6" rx="3" fill="#5f6368"/>
+              <rect x="28" y="40" width="64" height="6" rx="3" fill="#5f6368"/>
+              <rect x="28" y="54" width="36" height="6" rx="3" fill="#5f6368"/>
+              <circle cx="92" cy="58" r="18" fill="#8ab4f8" opacity="0.9"/>
+              <path d="M86 58h12M92 52v12" stroke="#1f1f1f" stroke-width="2.5" stroke-linecap="round"/>
+            </svg>
+          </div>
+          <h2>No habits yet</h2>
+          <p>Add a habit to this list to start tracking.</p>
+          <button class="btn btn-primary" type="button" onclick="openHabitModal()">Add a habit</button>
+        </div>
+      </section>
     </main>
 
     <!-- ============ STATS VIEW ============ -->
     <main id="view-stats" class="view">
-      <div class="stats-summary" id="stats-summary"></div>
-      <div id="stats-list" class="stats-list"></div>
+      <section class="tasks-card stats-card">
+        <div class="tasks-card-head">
+          <h2 class="tasks-card-title" id="stats-list-title">Statistics</h2>
+        </div>
+        <div class="stats-summary" id="stats-summary"></div>
+        <div id="stats-list" class="stats-list"></div>
+      </section>
     </main>
 
     <!-- ============ SETTINGS VIEW ============ -->
     <main id="view-settings" class="view">
+      <section class="card">
+        <h2>Lists</h2>
+        <p class="muted">Organize habits into separate lists (like Google Tasks).</p>
+        <div id="settings-lists" class="settings-lists"></div>
+        <button class="btn btn-ghost" type="button" id="btn-new-list-settings">+ New list</button>
+      </section>
+
       <section class="card">
         <h2><span class="card-icon" aria-hidden="true">☁</span> Google Sheets sync</h2>
         <p class="muted">Data is saved as <b>Atomic Habits DB</b> in your Drive. Devices <b>auto-sync</b> with the Sheet (source of truth): new devices load the cloud copy, then refresh periodically. <b>Restore</b> pulls the latest Sheet; <b>Upload</b> pushes this device’s changes. Concurrent edits merge automatically when safe.</p>
@@ -114,6 +145,11 @@
       <p class="muted center">Suraj Pratap’s Atomic Habits · offline-first PWA</p>
     </main>
 
+    <!-- ============ FAB ============ -->
+    <button type="button" class="fab" id="fab-add" onclick="openHabitModal()" aria-label="Add habit" title="Add habit">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round"/></svg>
+    </button>
+
     <!-- ============ BOTTOM NAV ============ -->
     <nav class="bottom-nav" aria-label="Main">
       <button class="nav-btn active" data-view="today" type="button">
@@ -121,11 +157,6 @@
           <svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
         </span>
         Today
-      </button>
-      <button class="nav-btn nav-add" onclick="openHabitModal()" type="button" aria-label="Add habit">
-        <span class="nav-icon" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-        </span>
       </button>
       <button class="nav-btn" data-view="stats" type="button">
         <span class="nav-icon" aria-hidden="true">
@@ -141,12 +172,25 @@
       </button>
     </nav>
 
+    <!-- ============ LIST MENU POPOVER ============ -->
+    <div class="menu-backdrop hidden" id="list-menu-backdrop">
+      <div class="menu-popover" id="list-menu" role="menu" aria-label="List options">
+        <button type="button" class="menu-item" data-list-action="rename" role="menuitem">Rename list</button>
+        <button type="button" class="menu-item" data-list-action="create" role="menuitem">Create new list</button>
+        <button type="button" class="menu-item menu-item-danger" data-list-action="delete" role="menuitem">Delete list</button>
+      </div>
+    </div>
+
     <!-- ============ HABIT MODAL ============ -->
     <div class="modal-backdrop hidden" id="habit-modal">
       <div class="modal modal-scroll" role="dialog" aria-modal="true" aria-labelledby="modal-title">
         <h2 id="modal-title">New habit</h2>
         <label class="field-label" for="habit-name">Name</label>
         <input type="text" id="habit-name" placeholder="e.g. Brush teeth" maxlength="60" />
+
+        <label class="field-label" for="habit-list-select">List</label>
+        <select id="habit-list-select" aria-label="Move to list"></select>
+        <p class="field-hint" id="habit-list-hint">New habits go into the active list. Change this to move a habit.</p>
 
         <label class="field-label">Type</label>
         <div class="seg-row" role="group" aria-label="Habit type">

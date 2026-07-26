@@ -371,18 +371,24 @@ function writeAll(data) {
   // 2. human-readable Habits tab
   const habitsSheet = ss.getSheetByName(HABITS_SHEET);
   habitsSheet.clearContents();
-  habitsSheet.getRange(1, 1, 1, 8)
-    .setValues([["ID", "Name", "Emoji", "Created", "Type", "Schedule", "Daily limit", "Total"]])
+  habitsSheet.getRange(1, 1, 1, 9)
+    .setValues([["ID", "Name", "Emoji", "Created", "Type", "Schedule", "Daily limit", "Total", "List"]])
     .setFontWeight("bold");
 
+  const listNameById = {};
+  (data.lists || []).forEach(function (l) {
+    if (l && l.id != null) listNameById[String(l.id)] = l.name || "";
+  });
+
   if (habits.length) {
-    habitsSheet.getRange(2, 1, habits.length, 8).setValues(
+    habitsSheet.getRange(2, 1, habits.length, 9).setValues(
       habits.map(function (h) {
         var type = h.type === "bad" ? "bad" : "good";
         var total = type === "bad" ? (countTotals[h.id] || 0) : (checkTotals[h.id] || 0);
         var limit = (type === "bad" && h.dailyLimit != null && h.dailyLimit !== "")
           ? h.dailyLimit
           : "";
+        var listLabel = h.listId != null ? (listNameById[String(h.listId)] || String(h.listId)) : "";
         return [
           h.id,
           h.name,
@@ -392,6 +398,7 @@ function writeAll(data) {
           scheduleLabel(h),
           limit,
           total,
+          listLabel,
         ];
       })
     );
