@@ -760,8 +760,6 @@ function renderListTabs() {
   }
 
   const active = getActiveList();
-  const titleEl = document.getElementById("active-list-title");
-  if (titleEl) titleEl.textContent = active ? active.name : DEFAULT_LIST_NAME;
   const statsTitle = document.getElementById("stats-list-title");
   if (statsTitle) statsTitle.textContent = (active ? active.name : "Habits") + " · Stats";
   renderActiveListProgress();
@@ -2402,11 +2400,6 @@ const btnSortHint = document.getElementById("btn-sort-hint");
 if (btnSortHint) {
   btnSortHint.addEventListener("click", () => toast("My order — drag habits to rearrange"));
 }
-const avatarBtn = document.getElementById("avatar-btn");
-if (avatarBtn) {
-  avatarBtn.addEventListener("click", () => toast("Suraj Pratap’s Atomic Habits"));
-}
-
 render();
 
 // Establish cloud state before auto-sync may fire (fail-safe for new devices).

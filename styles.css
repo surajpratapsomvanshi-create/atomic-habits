@@ -55,47 +55,59 @@ body {
 .center { text-align: center; margin: 16px 0 calc(var(--nav-h) + 16px); }
 .spacer { flex: 1; }
 
-/* ============ header (slim: sync + avatar) ============ */
-.app-header {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  padding: calc(env(safe-area-inset-top, 0px) + 6px) 12px 0;
+/* ============ top band (tabs + thin progress) ============ */
+.top-band {
+  flex: 0 0 auto;
+  padding-top: env(safe-area-inset-top, 0px);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
 }
-.header-right {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 8px;
-}
-.avatar-btn {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  border: none;
-  background: linear-gradient(145deg, #669df6, #8ab4f8);
-  color: #1a1a1a;
-  font-size: 0.88rem;
-  font-weight: 700;
-  font-family: inherit;
-  cursor: pointer;
-  display: grid;
-  place-items: center;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
-  transition: transform 0.12s, filter 0.15s;
-}
-.avatar-btn:hover { filter: brightness(1.06); }
-.avatar-btn:active { transform: scale(0.94); }
-.avatar-btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
-
-/* ============ list tabs ============ */
 .list-tabs-wrap {
   display: flex;
   align-items: stretch;
   gap: 0;
-  padding: 0 4px 0 0;
-  border-bottom: 1px solid var(--border);
+  padding: 2px 4px 0 0;
 }
+.top-day-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 6px;
+  min-height: 14px;
+}
+.top-day-progress.hidden { display: none; }
+.top-day-progress-track {
+  flex: 1;
+  min-width: 0;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.top-day-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: var(--accent-grad);
+  transition: width 0.28s ease;
+}
+.top-day-progress.progress-complete .top-day-progress-fill {
+  background: linear-gradient(135deg, #81c995, #5bb974);
+}
+.top-day-progress-meta {
+  flex: 0 0 auto;
+  font-size: 0.66rem;
+  font-weight: 600;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  line-height: 1;
+}
+.top-day-progress.progress-complete .top-day-progress-meta {
+  color: var(--green);
+}
+
+/* ============ list tabs ============ */
 .list-tabs {
   flex: 1;
   min-width: 0;
@@ -195,63 +207,20 @@ body {
   gap: 8px;
   padding: 10px 12px 6px;
 }
-.tasks-card-head-main {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  gap: 12px;
+.tasks-card-head-actions {
+  justify-content: flex-end;
+  padding: 4px 8px 0;
+  min-height: 40px;
 }
 .tasks-card-title {
-  flex: 0 1 auto;
+  flex: 1;
   min-width: 0;
-  max-width: 55%;
   font-size: 1rem;
   font-weight: 500;
   letter-spacing: -0.01em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-/* Compact good-habits progress beside list name */
-.list-day-progress {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex: 1 1 auto;
-  min-width: 72px;
-  max-width: 160px;
-}
-.list-day-progress.hidden { display: none; }
-.list-day-progress-track {
-  flex: 1;
-  min-width: 0;
-  height: 4px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
-  overflow: hidden;
-}
-.list-day-progress-fill {
-  height: 100%;
-  width: 0%;
-  border-radius: inherit;
-  background: var(--accent-grad);
-  transition: width 0.28s ease;
-}
-.list-day-progress.progress-complete .list-day-progress-fill {
-  background: linear-gradient(135deg, #81c995, #5bb974);
-}
-.list-day-progress-meta {
-  flex: 0 0 auto;
-  font-size: 0.68rem;
-  font-weight: 600;
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.02em;
-}
-.list-day-progress.progress-complete .list-day-progress-meta {
-  color: #81c995;
 }
 .tasks-card-actions {
   display: flex;
@@ -355,11 +324,17 @@ body {
 .settings-list-row .mini-btn:hover { color: var(--text); background: rgba(255,255,255,0.06); }
 .settings-list-row .mini-btn.danger:hover { color: var(--red); }
 
+.sync-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .sync-indicator {
-  font-size: 0.55rem;
+  font-size: 0.7rem;
   color: var(--muted);
-  transition: color 0.3s, box-shadow 0.3s;
+  transition: color 0.3s, filter 0.3s;
   line-height: 1;
+  margin-left: auto;
   filter: drop-shadow(0 0 0 transparent);
 }
 .sync-indicator.ok { color: var(--green); filter: drop-shadow(0 0 4px rgba(129, 201, 149, 0.55)); }

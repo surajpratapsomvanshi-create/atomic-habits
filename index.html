@@ -13,20 +13,20 @@
 <body>
   <div id="app">
 
-    <!-- ============ HEADER (compact: sync + avatar only) ============ -->
-    <header class="app-header">
-      <div class="header-right">
-        <span id="sync-indicator" class="sync-indicator" title="Sync status" aria-label="Sync status">●</span>
-        <button type="button" class="avatar-btn" id="avatar-btn" title="Suraj Pratap" aria-label="Suraj Pratap">S</button>
+    <!-- ============ TOP BAND: list tabs + good-habit progress ============ -->
+    <div class="top-band" id="top-band">
+      <div class="list-tabs-wrap" id="list-tabs-wrap">
+        <div class="list-tabs" id="list-tabs" role="tablist" aria-label="Habit lists"></div>
+        <button type="button" class="list-tab-add" id="btn-tab-new-list" title="Create new list" aria-label="Create new list">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
       </div>
-    </header>
-
-    <!-- ============ LIST TABS ============ -->
-    <div class="list-tabs-wrap" id="list-tabs-wrap">
-      <div class="list-tabs" id="list-tabs" role="tablist" aria-label="Habit lists"></div>
-      <button type="button" class="list-tab-add" id="btn-tab-new-list" title="Create new list" aria-label="Create new list">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-      </button>
+      <div class="top-day-progress hidden" id="list-day-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+        <div class="top-day-progress-track" aria-hidden="true">
+          <div class="top-day-progress-fill" id="list-day-progress-fill"></div>
+        </div>
+        <span class="top-day-progress-meta" id="list-day-progress-meta"></span>
+      </div>
     </div>
 
     <!-- ============ TODAY VIEW ============ -->
@@ -46,16 +46,7 @@
       </div>
 
       <section class="tasks-card" aria-label="Habit list">
-        <div class="tasks-card-head">
-          <div class="tasks-card-head-main">
-            <h2 class="tasks-card-title" id="active-list-title">Atomic Habits</h2>
-            <div class="list-day-progress hidden" id="list-day-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
-              <div class="list-day-progress-track" aria-hidden="true">
-                <div class="list-day-progress-fill" id="list-day-progress-fill"></div>
-              </div>
-              <span class="list-day-progress-meta" id="list-day-progress-meta"></span>
-            </div>
-          </div>
+        <div class="tasks-card-head tasks-card-head-actions">
           <div class="tasks-card-actions">
             <button type="button" class="icon-btn" id="btn-sort-hint" title="My order" aria-label="Sort: My order">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h12M3 12h8M3 18h5" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/><path d="M17 8l3 3-3 3M20 11H11" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -105,7 +96,10 @@
       </section>
 
       <section class="card">
-        <h2><span class="card-icon" aria-hidden="true">☁</span> Google Sheets sync</h2>
+        <h2 class="sync-heading">
+          <span class="card-icon" aria-hidden="true">☁</span> Google Sheets sync
+          <span id="sync-indicator" class="sync-indicator" title="Sync status" aria-label="Sync status">●</span>
+        </h2>
         <p class="muted">Data is saved as <b>Atomic Habits DB</b> in your Drive. Devices <b>auto-sync</b> with the Sheet (source of truth): new devices load the cloud copy, then refresh periodically. <b>Restore</b> pulls the latest Sheet; <b>Upload</b> pushes this device’s changes. Concurrent edits merge automatically when safe.</p>
         <label class="field-label" for="script-url">Web App URL</label>
         <input type="url" id="script-url" placeholder="https://script.google.com/macros/s/…/exec" value="https://script.google.com/macros/s/AKfycbxxcZhrVNYDpg4ZUfFQNDGudJKUJENaQRRcoyMio8_YEdo5GoKscHAGyUhEd0iK9NkG/exec" />
