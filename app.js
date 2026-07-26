@@ -1268,6 +1268,167 @@ function markUserEdit() {
   lastUserEditAt = Date.now();
 }
 
+/** True when a payload has at least one habit. */
+function dataHasHabits(d) {
+  return !!(d && Array.isArray(d.habits) && d.habits.length > 0);
+}
+
+/**
+ * Merge local pending edits onto cloud (source of truth base):
+ * habits by id (local fields win on same id), checks union, counts take max.
+ * Returns null if merge isn't cleanly possible.
+ */
+function mergeHabitData(localData, cloudData) {
+  if (!dataHasHabits(cloudData)) return null;
+  if (!dataHasHabits(localData)) return null;
+  const loc = migrateData(localData);
+  const cld = migrateData(cloudData);
+  if (!dataHasHabits(cld)) return null;
+
+  const byId = new Map();
+  // Cloud first (source of truth). Local-only habit ids are added; same-id keeps cloud fields.
+  for (const h of cld.habits) {
+    if (h && h.id != null) byId.set(String(h.id), Object.assign({}, h));
+  }
+  for (const h of loc.habits) {
+    if (!h || h.id == null) continue;
+    const id = String(h.id);
+    // Skip seed-only locals that cloud never had (avoid re-seeding cloud).
+    if (id.startsWith("h-seed") && !byId.has(id)) continue;
+    if (byId.has(id)) continue; // same id → keep cloud
+    byId.set(id, Object.assign({}, h));
+  }
+  const habits = Array.from(byId.values());
+
+  const checks = {};
+  const checkDates = new Set([
+    ...Object.keys(cld.checks || {}),
+    ...Object.keys(loc.checks || {}),
+  ]);
+  for (const day of checkDates) {
+    const set = new Set([
+      ...((cld.checks && cld.checks[day]) || []),
+      ...((loc.checks && loc.checks[day]) || []),
+    ].map(String));
+    if (set.size) checks[day] = Array.from(set);
+  }
+
+  const counts = {};
+  const countDates = new Set([
+    ...Object.keys(cld.counts || {}),
+    ...Object.keys(loc.counts || {}),
+  ]);
+  for (const day of countDates) {
+    const a = (cld.counts && cld.counts[day]) || {};
+    const b = (loc.counts && loc.counts[day]) || {};
+    const ids = new Set([...Object.keys(a), ...Object.keys(b)]);
+    const row = {};
+    for (const id of ids) {
+      row[id] = Math.max(Number(a[id]) || 0, Number(b[id]) || 0);
+    }
+    if (Object.keys(row).length) counts[day] = row;
+  }
+
+  return migrateData({ habits, checks, counts });
+}
+
+/** Load full cloud snapshot (for merge / conflict resolve). */
+async function fetchCloudSnapshot() {
+  const res = await fetch(settings.scriptUrl + "?action=load");
+  const out = await res.json();
+  if (!out || !out.ok || !out.data) return null;
+  return out;
+}
+
+/**
+ * Auto-resolve a stale/conflict revision: merge when safe, else pull cloud.
+ * Never blank-overwrites the Sheet. No force path.
+ */
+async function resolveConflictAuto(cloudOrOut, opts) {
+  opts = opts || {};
+  setSyncIndicator("pending", "Syncing…");
+
+  // Prefer embedded snapshot from conflict response; otherwise load.
+  let cloudData = cloudOrOut && cloudOrOut.data ? cloudOrOut.data : null;
+  let cloudRev = cloudOrOut && cloudOrOut.revision != null ? cloudOrOut.revision : null;
+  let cloudMeta = cloudOrOut;
+  if (!cloudData) {
+    try {
+      const loaded = await fetchCloudSnapshot();
+      if (!loaded) {
+        setSyncIndicator("error", "Can't load cloud to resolve");
+        toast("Can't reach cloud — data is safe locally");
+        return false;
+      }
+      cloudData = loaded.data;
+      cloudRev = loaded.revision;
+      cloudMeta = loaded;
+    } catch (err) {
+      setSyncIndicator("error", "Can't load cloud to resolve");
+      toast("Can't reach cloud — data is safe locally");
+      return false;
+    }
+  }
+
+  updateSyncSafetyText(cloudMeta);
+
+  // Blank/fresh local or blank-push conflict → prefer cloud, never overwrite.
+  if (isFreshLocal() || (cloudOrOut && cloudOrOut.reason === "blank") || !dataHasHabits(data)) {
+    rememberRevision(cloudMeta);
+    saveSettings();
+    const ok = await restoreFromSheet({
+      skipConfirm: true,
+      auto: !!opts.auto,
+      fromPoll: !!opts.fromPoll,
+      toastMsg: "Loaded cloud version",
+    });
+    return ok;
+  }
+
+  const pendingLocal = migrateData(JSON.parse(JSON.stringify(data)));
+  const merged = mergeHabitData(pendingLocal, cloudData);
+
+  if (!merged) {
+    rememberRevision(cloudMeta);
+    saveSettings();
+    const ok = await restoreFromSheet({
+      skipConfirm: true,
+      auto: false,
+      fromPoll: !!opts.fromPoll,
+      toastMsg: "Loaded cloud version",
+    });
+    return ok;
+  }
+
+  // Apply merge locally, adopt cloud revision as base, then push.
+  makeLocalBackup();
+  data = merged;
+  saveData();
+  if (cloudRev != null) {
+    settings.lastSeenRevision = cloudRev;
+    settings.lastSeenUpdatedAt = (cloudMeta && cloudMeta.updatedAt) || new Date().toISOString();
+  }
+  saveSettings();
+  render();
+
+  const pushed = await pushSnapshot({ silent: true, afterMerge: true });
+  if (pushed) {
+    setSyncIndicator("ok", "Merged with cloud · rev " + (settings.lastSeenRevision != null ? settings.lastSeenRevision : "?"));
+    if (!opts.silent) toast("Synced — merged with cloud");
+    return true;
+  }
+
+  // Concurrent edit during merge push → take cloud (never force).
+  rememberRevision(cloudMeta);
+  saveSettings();
+  await restoreFromSheet({
+    skipConfirm: true,
+    fromPoll: true,
+    toastMsg: "Loaded cloud version",
+  });
+  return false;
+}
+
 /**
  * Runs once at startup (and when the script URL changes): establishes cloud
  * state before auto-sync may fire. New/blank devices auto-restore from cloud.
@@ -1314,10 +1475,11 @@ async function initSync() {
     return;
   }
 
-  // Real conflict: local has data and cloud moved ahead.
+  // Cloud moved ahead while this device has real data → merge or pull (no force UI).
   autoSyncArmed = false;
-  setSyncIndicator("warn", "Cloud changed elsewhere — resolve conflict");
-  showConflictModal(cloud, { newDevice: false });
+  setSyncIndicator("pending", "Cloud changed — syncing…");
+  await resolveConflictAuto(cloud, { auto: true, silent: true });
+  startPolling();
 }
 
 function queueSync() {
@@ -1331,17 +1493,49 @@ function queueSync() {
 }
 
 /**
- * Upload this device's data to the cloud.
- * opts.force  → bypass conflict/blank guards (explicit overwrite).
+ * POST current `data` with baseRevision. Returns true on success.
+ * On conflict, optionally auto-resolves (merge/pull) unless opts.skipResolve.
+ */
+async function pushSnapshot(opts) {
+  opts = opts || {};
+  const res = await fetch(settings.scriptUrl, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({
+      action: "save",
+      data,
+      baseRevision: settings.lastSeenRevision,
+      deviceId: settings.deviceId,
+    }),
+  });
+  const out = await res.json();
+  if (out && out.conflict) {
+    updateSyncSafetyText(out);
+    if (opts.skipResolve || opts.afterMerge) return false;
+    await resolveConflictAuto(out, { silent: opts.silent });
+    return autoSyncArmed && !localDirty;
+  }
+  if (!out || !out.ok) throw new Error((out && out.error) || "Unknown error");
+  settings.lastSync = new Date().toISOString();
+  rememberRevision(out);
+  saveSettings();
+  autoSyncArmed = true;
+  localDirty = false;
+  updateSyncSafetyText(out);
+  return true;
+}
+
+/**
+ * Upload this device's data to the cloud (optimistic concurrency).
+ * On stale revision: auto-merge pending local edits onto cloud, or pull cloud.
  * opts.silent → quieter status (used by poll when pushing pending edits).
  */
 async function syncNow(opts) {
   opts = opts || {};
-  const force = opts.force === true;
   if (!settings.scriptUrl) { toast("Set the Web App URL in Settings first"); return; }
 
-  // New/blank device with cloud data → restore first instead of rejecting.
-  if (!force && isFreshLocal()) {
+  // New/blank device with cloud data → restore first instead of uploading seeds.
+  if (isFreshLocal()) {
     let cloud;
     try {
       cloud = await fetchCloudInfo();
@@ -1358,7 +1552,7 @@ async function syncNow(opts) {
       return;
     }
     autoSyncArmed = true;
-  } else if (!force && !autoSyncArmed) {
+  } else if (!autoSyncArmed) {
     let cloud;
     try {
       cloud = await fetchCloudInfo();
@@ -1369,7 +1563,7 @@ async function syncNow(opts) {
     }
     updateSyncSafetyText(cloud);
     if (!cloudSafeToOverwrite(cloud)) {
-      showConflictModal(cloud, { newDevice: false });
+      await resolveConflictAuto(cloud, { silent: opts.silent });
       return;
     }
     autoSyncArmed = true;
@@ -1377,37 +1571,11 @@ async function syncNow(opts) {
 
   setSyncIndicator("pending", opts.silent ? "Syncing…" : "Uploading…");
   try {
-    // text/plain avoids the CORS preflight that Apps Script can't answer
-    const res = await fetch(settings.scriptUrl, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({
-        action: "save",
-        data,
-        baseRevision: settings.lastSeenRevision,
-        deviceId: settings.deviceId,
-        force,
-      }),
-    });
-    const out = await res.json();
-    if (out && out.conflict) {
-      autoSyncArmed = false;
-      localDirty = true;
-      updateSyncSafetyText(out);
-      setSyncIndicator("warn", "Conflict — cloud not overwritten");
-      showConflictModal(out, { newDevice: isFreshLocal() });
-      return;
-    }
-    if (!out || !out.ok) throw new Error((out && out.error) || "Unknown error");
-    settings.lastSync = new Date().toISOString();
-    rememberRevision(out);
-    saveSettings();
-    autoSyncArmed = true;
-    localDirty = false;
-    updateSyncSafetyText(out);
-    const rev = out.revision != null ? " · rev " + out.revision : "";
+    const ok = await pushSnapshot({ silent: opts.silent });
+    if (!ok) return;
+    const rev = settings.lastSeenRevision != null ? " · rev " + settings.lastSeenRevision : "";
     setSyncIndicator("ok", "Uploaded: " + new Date(settings.lastSync).toLocaleString() + rev);
-    if (!opts.silent) toast(out.revision != null ? "Uploaded to cloud ✓" : "Synced ✓ (legacy backend)");
+    if (!opts.silent) toast(settings.lastSeenRevision != null ? "Uploaded to cloud ✓" : "Synced ✓ (legacy backend)");
   } catch (err) {
     setSyncIndicator("error", "Upload failed: " + err.message);
     if (!opts.silent) toast("Upload failed — data is safe locally");
@@ -1453,7 +1621,8 @@ async function restoreFromSheet(opts) {
       updateSyncSafetyText(out);
       const rev = out.revision != null ? " · rev " + out.revision : "";
       setSyncIndicator("ok", (opts.auto ? "Loaded from Google Sheet" : "Restored from cloud") + rev);
-      if (opts.auto) toast("Loaded from Google Sheet");
+      if (opts.toastMsg) toast(opts.toastMsg);
+      else if (opts.auto) toast("Loaded from Google Sheet");
       else if (opts.fromPoll) toast("Updated from cloud");
       else toast(backedUp ? "Restored ✓ (local backup saved)" : "Restored from cloud ✓");
       return true;
@@ -1464,19 +1633,6 @@ async function restoreFromSheet(opts) {
     if (!opts.fromPoll) toast("Restore failed: " + err.message);
     return false;
   }
-}
-
-/** Explicit, guarded overwrite of cloud with this device's data. */
-async function forceReplaceCloud() {
-  const phrase = prompt(
-    "This OVERWRITES cloud data for ALL devices with this device's data.\n" +
-    "The previous cloud snapshot is archived in the Sheet's _history tab.\n\n" +
-    "Type REPLACE to confirm:"
-  );
-  if (phrase == null) return;
-  if (phrase.trim().toUpperCase() !== "REPLACE") { toast("Cancelled — cloud unchanged"); return; }
-  closeSyncModal();
-  await syncNow({ force: true });
 }
 
 /* ---------------- periodic cloud refresh ---------------- */
@@ -1501,18 +1657,21 @@ function scheduleNextPoll(ms) {
   updateSyncSafetyText(null);
 }
 
-async function pollCloud() {
+async function pollCloud(opts) {
+  opts = opts || {};
   pollTimer = null;
   if (!settings.scriptUrl || settings.autoRefresh === false) return;
   if (typeof document !== "undefined" && document.hidden) {
     // Resume when the tab becomes visible again.
     return;
   }
-  // Don't yank UI mid-edit.
-  const sinceEdit = Date.now() - lastUserEditAt;
-  if (lastUserEditAt && sinceEdit < POLL_EDIT_DEBOUNCE_MS) {
-    scheduleNextPoll(POLL_EDIT_DEBOUNCE_MS - sinceEdit + 200);
-    return;
+  // Don't yank UI mid-edit (forced polls from tests/debug skip this).
+  if (!opts.force) {
+    const sinceEdit = Date.now() - lastUserEditAt;
+    if (lastUserEditAt && sinceEdit < POLL_EDIT_DEBOUNCE_MS) {
+      scheduleNextPoll(POLL_EDIT_DEBOUNCE_MS - sinceEdit + 200);
+      return;
+    }
   }
   if (!autoSyncArmed && settings.lastSeenRevision == null) {
     scheduleNextPoll();
@@ -1537,7 +1696,7 @@ async function pollCloud() {
 
   if (cloudAhead) {
     if (localDirty || syncTimer) {
-      // Local has pending edits — try push; conflict UI on failure.
+      // Local has pending edits — try push; auto-merge on conflict.
       await syncNow({ silent: true });
     } else if (autoSyncArmed || seen != null) {
       await restoreFromSheet({ skipConfirm: true, fromPoll: true });
@@ -1621,28 +1780,6 @@ function openSyncModal(cfg) {
 function closeSyncModal() {
   const modal = document.getElementById("sync-modal");
   if (modal) modal.classList.add("hidden");
-}
-
-function showConflictModal(cloud, opts) {
-  opts = opts || {};
-  const when = cloud && cloud.updatedAt ? new Date(cloud.updatedAt).toLocaleString() : "another device";
-  const revBit = cloud && cloud.revision != null ? "revision " + cloud.revision : "a newer revision";
-  const lead = opts.newDevice
-    ? "This device is blank/new and the cloud already has data"
-    : "The cloud has changed since this device last synced";
-  openSyncModal({
-    title: "Sync conflict",
-    body:
-      "<p class=\"muted\">" + lead + " (" + revBit + ", updated " + when + ").</p>" +
-      "<p class=\"muted\">Nothing was overwritten. Choose how to resolve:</p>" +
-      "<p class=\"muted\"><b>Restore cloud</b> is the safe option (a local backup is kept). " +
-      "<b>Force replace</b> overwrites the cloud with this device — the previous cloud snapshot is archived in the Sheet's history.</p>",
-    buttons: [
-      { label: "Cancel", cls: "btn-ghost", onClick: () => { closeSyncModal(); setSyncIndicator("warn", "Conflict unresolved — cloud not overwritten"); } },
-      { label: "Force replace cloud", cls: "btn-danger", onClick: () => forceReplaceCloud() },
-      { label: "Restore cloud", cls: "btn-primary", onClick: async () => { closeSyncModal(); await restoreFromSheet({ skipConfirm: true }); } },
-    ],
-  });
 }
 
 /* ---------------- backup / import ---------------- */
@@ -1770,8 +1907,6 @@ if (pollIntervalInput) {
 
 document.getElementById("btn-sync-now").addEventListener("click", () => syncNow());
 document.getElementById("btn-restore").addEventListener("click", () => restoreFromSheet());
-const btnForce = document.getElementById("btn-force-replace");
-if (btnForce) btnForce.addEventListener("click", () => forceReplaceCloud());
 const syncModal = document.getElementById("sync-modal");
 if (syncModal) syncModal.addEventListener("click", (e) => { if (e.target.id === "sync-modal") closeSyncModal(); });
 document.getElementById("btn-export").addEventListener("click", exportJson);
@@ -1847,8 +1982,10 @@ initSync();
 // Test hooks (sync-tests.js / manual debug). Harmless in production.
 try {
   window.__ahSync = {
-    pollCloud: () => pollCloud(),
+    pollCloud: (opts) => pollCloud(opts),
     getPollState: () => ({ pollTimer, nextPollAt, localDirty, autoSyncArmed, lastSeenRevision: settings.lastSeenRevision }),
+    markDirty: () => { localDirty = true; },
+    mergeHabitData,
   };
 } catch (e) { /* non-browser */ }
 
