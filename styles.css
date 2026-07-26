@@ -1107,7 +1107,8 @@ body.habit-drag-active * { cursor: grabbing !important; }
 input[type="text"],
 input[type="url"],
 input[type="number"],
-input[type="date"] {
+input[type="date"],
+select {
   width: 100%;
   background: var(--bg-elevated);
   border: 1px solid var(--border-strong);
@@ -1119,7 +1120,8 @@ input[type="date"] {
   outline: none;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
-input:focus {
+input:focus,
+select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }

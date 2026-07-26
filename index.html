@@ -72,14 +72,23 @@
     <main id="view-settings" class="view">
       <section class="card">
         <h2><span class="card-icon" aria-hidden="true">☁</span> Google Sheets sync</h2>
-        <p class="muted">Data is saved as <b>Atomic Habits DB</b> in your Drive folder. Sync is <b>fail-safe</b>: a new or blank device won't overwrite existing cloud data — it will offer to restore instead, and conflicts are flagged rather than silently overwriting.</p>
-        <p class="muted"><b>Redeploy required for full protection:</b> after updating <code>google-apps-script.gs</code>, deploy a <b>new version</b> of the Web App. Until then only client-side safeguards are active (the old backend can't detect conflicts server-side).</p>
+        <p class="muted">Data is saved as <b>Atomic Habits DB</b> in your Drive folder. New devices <b>auto-load</b> the cloud copy, then refresh periodically. Conflicts between two active devices still ask before overwriting.</p>
         <label class="field-label" for="script-url">Web App URL</label>
         <input type="url" id="script-url" placeholder="https://script.google.com/macros/s/…/exec" value="https://script.google.com/macros/s/AKfycbxxcZhrVNYDpg4ZUfFQNDGudJKUJENaQRRcoyMio8_YEdo5GoKscHAGyUhEd0iK9NkG/exec" />
         <label class="toggle-row">
           <span>Auto-sync after every change</span>
           <input type="checkbox" id="auto-sync" checked />
         </label>
+        <label class="toggle-row">
+          <span>Auto-refresh from cloud</span>
+          <input type="checkbox" id="auto-refresh" checked />
+        </label>
+        <label class="field-label" for="poll-interval">Refresh interval</label>
+        <select id="poll-interval">
+          <option value="15000">Every 15 seconds</option>
+          <option value="45000" selected>Every 45 seconds</option>
+          <option value="60000">Every 1 minute</option>
+        </select>
         <div class="btn-row">
           <button class="btn btn-primary" id="btn-sync-now">Upload this device</button>
           <button class="btn btn-ghost" id="btn-restore">Restore from cloud</button>
@@ -88,7 +97,7 @@
           <button class="btn btn-danger" id="btn-force-replace">Force replace cloud…</button>
         </div>
         <p class="muted" id="sync-status-text">Never synced.</p>
-        <p class="muted" id="sync-safety-text">Device — · last seen rev —</p>
+        <p class="muted" id="sync-safety-text">Device — · last pull — · next refresh in —</p>
       </section>
 
       <section class="card">

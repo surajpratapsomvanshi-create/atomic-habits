@@ -24,6 +24,10 @@ const LS_SETTINGS = "ah.settings";
 const DEFAULT_SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbxxcZhrVNYDpg4ZUfFQNDGudJKUJENaQRRcoyMio8_YEdo5GoKscHAGyUhEd0iK9NkG/exec";
 
+/** Default poll interval when auto-refresh is on. */
+const DEFAULT_POLL_MS = 45000;
+const POLL_EDIT_DEBOUNCE_MS = 2500;
+
 const EMOJIS = ["🦷","💧","🏃","📖","🧘","💪","😴","🥗","✍️","🚭","🧹","💊","🌞","🎸","💻","🙏"];
 const COLORS = ["#5b8def","#3ecf8e","#e8b84a","#f07178","#a78bfa","#f472b6","#22d3ee","#fb923c"];
 const DOW_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -54,6 +58,16 @@ let syncTimer = null;
 let autoSyncArmed = false;
 /** True once initSync has finished its first cloud check. */
 let cloudChecked = false;
+/** Local edits waiting to push (set by queueSync, cleared after successful upload/restore). */
+let localDirty = false;
+/** Timestamp of last user edit — used to debounce mid-tap cloud pulls. */
+let lastUserEditAt = 0;
+/** Periodic cloud refresh timer. */
+let pollTimer = null;
+/** When the next poll is due (ms epoch), for Settings status. */
+let nextPollAt = null;
+/** Last successful cloud pull timestamp. */
+let lastPullAt = null;
 
 /* ---------------- persistence ---------------- */
 function load(key, fallback) {
@@ -69,6 +83,8 @@ function loadSettings() {
   const defaults = {
     scriptUrl: DEFAULT_SCRIPT_URL,
     autoSync: true,
+    autoRefresh: true,         // poll cloud while app is open
+    pollIntervalMs: DEFAULT_POLL_MS,
     lastSync: null,
     // Fail-safe sync state:
     deviceId: null,            // stable per-device id
@@ -1173,6 +1189,7 @@ function setSyncIndicator(state, text) {
     const t = document.getElementById("sync-status-text");
     if (t) t.textContent = text;
   }
+  updateSyncSafetyText(null);
 }
 
 /**
@@ -1188,6 +1205,18 @@ function isFreshLocal() {
   if (habits.length === 0) return true;
   const onlySeed = habits.every((h) => String(h.id || "").startsWith("h-seed"));
   return onlySeed && !hasHistory;
+}
+
+/** New/blank device that should auto-load cloud instead of uploading. */
+function needsCloudOnboarding(cloud) {
+  if (!cloud || !cloud.hasData) return false;
+  // Only auto-restore seed/blank locals — never wipe real offline edits.
+  return isFreshLocal();
+}
+
+function pollIntervalMs() {
+  const n = Number(settings.pollIntervalMs);
+  return n > 0 ? n : DEFAULT_POLL_MS;
 }
 
 /** Fetch cloud metadata; falls back to ?action=load for legacy backends. */
@@ -1235,11 +1264,16 @@ function rememberRevision(out) {
   if (out && out.spreadsheetUrl) settings.spreadsheetUrl = out.spreadsheetUrl;
 }
 
+function markUserEdit() {
+  lastUserEditAt = Date.now();
+}
+
 /**
- * Runs once at startup: establishes cloud state before auto-sync may fire.
- * New/blank devices default to Restore rather than pushing.
+ * Runs once at startup (and when the script URL changes): establishes cloud
+ * state before auto-sync may fire. New/blank devices auto-restore from cloud.
  */
 async function initSync() {
+  stopPolling();
   if (!settings.scriptUrl) { autoSyncArmed = true; cloudChecked = true; return; }
   setSyncIndicator("pending", "Checking cloud…");
   let cloud;
@@ -1256,6 +1290,16 @@ async function initSync() {
   cloudChecked = true;
   updateSyncSafetyText(cloud);
 
+  // New / blank device with populated cloud → auto-restore (no reject modal).
+  if (needsCloudOnboarding(cloud)) {
+    autoSyncArmed = false;
+    setSyncIndicator("pending", "Syncing…");
+    toast("Syncing…");
+    await restoreFromSheet({ skipConfirm: true, auto: true });
+    startPolling();
+    return;
+  }
+
   if (cloudSafeToOverwrite(cloud)) {
     autoSyncArmed = true;
     if (cloud.hasData && cloud.revision != null &&
@@ -1266,40 +1310,55 @@ async function initSync() {
     } else {
       setSyncIndicator("ok", cloud.hasData ? "Ready" : "Cloud empty — this device will seed it");
     }
+    startPolling();
     return;
   }
 
-  // Not safe to overwrite: cloud has data this device hasn't loaded/owned.
+  // Real conflict: local has data and cloud moved ahead.
   autoSyncArmed = false;
-  if (isFreshLocal()) {
-    setSyncIndicator("warn", "Cloud has data — restore to this device first");
-    showNewDeviceModal(cloud);
-  } else {
-    setSyncIndicator("warn", "Cloud changed elsewhere — resolve conflict");
-    showConflictModal(cloud, { newDevice: false });
-  }
+  setSyncIndicator("warn", "Cloud changed elsewhere — resolve conflict");
+  showConflictModal(cloud, { newDevice: false });
 }
 
 function queueSync() {
+  markUserEdit();
+  localDirty = true;
   if (!settings.scriptUrl || !settings.autoSync) return;
   if (!autoSyncArmed) return; // never auto-push before cloud state is known
   setSyncIndicator("pending");
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => syncNow(), 2500); // debounce rapid taps
+  syncTimer = setTimeout(() => { syncTimer = null; syncNow(); }, 2500);
 }
 
 /**
  * Upload this device's data to the cloud.
  * opts.force  → bypass conflict/blank guards (explicit overwrite).
- * opts.silent → suppress the "verify cloud first" modal (used internally).
+ * opts.silent → quieter status (used by poll when pushing pending edits).
  */
 async function syncNow(opts) {
   opts = opts || {};
   const force = opts.force === true;
   if (!settings.scriptUrl) { toast("Set the Web App URL in Settings first"); return; }
 
-  // Guard: before any non-forced overwrite, verify we own the cloud state.
-  if (!force && (!autoSyncArmed || isFreshLocal())) {
+  // New/blank device with cloud data → restore first instead of rejecting.
+  if (!force && isFreshLocal()) {
+    let cloud;
+    try {
+      cloud = await fetchCloudInfo();
+    } catch (err) {
+      setSyncIndicator("error", "Can't reach cloud — not overwriting");
+      toast("Can't reach cloud — data is safe locally");
+      return;
+    }
+    updateSyncSafetyText(cloud);
+    if (cloud.hasData && !cloudSafeToOverwrite(cloud)) {
+      setSyncIndicator("pending", "Syncing…");
+      toast("Syncing…");
+      await restoreFromSheet({ skipConfirm: true, auto: true });
+      return;
+    }
+    autoSyncArmed = true;
+  } else if (!force && !autoSyncArmed) {
     let cloud;
     try {
       cloud = await fetchCloudInfo();
@@ -1310,13 +1369,13 @@ async function syncNow(opts) {
     }
     updateSyncSafetyText(cloud);
     if (!cloudSafeToOverwrite(cloud)) {
-      showConflictModal(cloud, { newDevice: isFreshLocal() });
+      showConflictModal(cloud, { newDevice: false });
       return;
     }
     autoSyncArmed = true;
   }
 
-  setSyncIndicator("pending", "Uploading…");
+  setSyncIndicator("pending", opts.silent ? "Syncing…" : "Uploading…");
   try {
     // text/plain avoids the CORS preflight that Apps Script can't answer
     const res = await fetch(settings.scriptUrl, {
@@ -1333,6 +1392,7 @@ async function syncNow(opts) {
     const out = await res.json();
     if (out && out.conflict) {
       autoSyncArmed = false;
+      localDirty = true;
       updateSyncSafetyText(out);
       setSyncIndicator("warn", "Conflict — cloud not overwritten");
       showConflictModal(out, { newDevice: isFreshLocal() });
@@ -1343,13 +1403,14 @@ async function syncNow(opts) {
     rememberRevision(out);
     saveSettings();
     autoSyncArmed = true;
+    localDirty = false;
     updateSyncSafetyText(out);
     const rev = out.revision != null ? " · rev " + out.revision : "";
     setSyncIndicator("ok", "Uploaded: " + new Date(settings.lastSync).toLocaleString() + rev);
-    toast(out.revision != null ? "Uploaded to cloud ✓" : "Synced ✓ (legacy backend)");
+    if (!opts.silent) toast(out.revision != null ? "Uploaded to cloud ✓" : "Synced ✓ (legacy backend)");
   } catch (err) {
     setSyncIndicator("error", "Upload failed: " + err.message);
-    toast("Upload failed — data is safe locally");
+    if (!opts.silent) toast("Upload failed — data is safe locally");
   }
 }
 
@@ -1371,9 +1432,9 @@ function makeLocalBackup() {
 
 async function restoreFromSheet(opts) {
   opts = opts || {};
-  if (!settings.scriptUrl) { toast("Set the Web App URL in Settings first"); return; }
-  if (!opts.skipConfirm && !confirm("Restore from cloud? A local backup will be saved first, then local data is replaced with the cloud copy.")) return;
-  setSyncIndicator("pending", "Restoring…");
+  if (!settings.scriptUrl) { toast("Set the Web App URL in Settings first"); return false; }
+  if (!opts.skipConfirm && !confirm("Restore from cloud? A local backup will be saved first, then local data is replaced with the cloud copy.")) return false;
+  setSyncIndicator("pending", opts.auto ? "Syncing…" : (opts.fromPoll ? "Refreshing…" : "Restoring…"));
   try {
     const res = await fetch(settings.scriptUrl + "?action=load");
     const out = await res.json();
@@ -1386,17 +1447,22 @@ async function restoreFromSheet(opts) {
       settings.lastSync = new Date().toISOString();
       saveSettings();
       autoSyncArmed = true;
+      localDirty = false;
+      lastPullAt = Date.now();
       render();
       updateSyncSafetyText(out);
       const rev = out.revision != null ? " · rev " + out.revision : "";
-      setSyncIndicator("ok", "Restored from cloud" + rev);
-      toast(backedUp ? "Restored ✓ (local backup saved)" : "Restored from cloud ✓");
-    } else {
-      throw new Error("Sheet has no saved data yet");
+      setSyncIndicator("ok", (opts.auto ? "Loaded from Google Sheet" : "Restored from cloud") + rev);
+      if (opts.auto) toast("Loaded from Google Sheet");
+      else if (opts.fromPoll) toast("Updated from cloud");
+      else toast(backedUp ? "Restored ✓ (local backup saved)" : "Restored from cloud ✓");
+      return true;
     }
+    throw new Error("Sheet has no saved data yet");
   } catch (err) {
     setSyncIndicator("error", "Restore failed: " + err.message);
-    toast("Restore failed: " + err.message);
+    if (!opts.fromPoll) toast("Restore failed: " + err.message);
+    return false;
   }
 }
 
@@ -1413,19 +1479,127 @@ async function forceReplaceCloud() {
   await syncNow({ force: true });
 }
 
+/* ---------------- periodic cloud refresh ---------------- */
+function stopPolling() {
+  clearTimeout(pollTimer);
+  pollTimer = null;
+  nextPollAt = null;
+  updateSyncSafetyText(null);
+}
+
+function startPolling() {
+  stopPolling();
+  if (!settings.scriptUrl || settings.autoRefresh === false) return;
+  scheduleNextPoll(pollIntervalMs());
+}
+
+function scheduleNextPoll(ms) {
+  clearTimeout(pollTimer);
+  const delay = Math.max(1000, ms || pollIntervalMs());
+  nextPollAt = Date.now() + delay;
+  pollTimer = setTimeout(() => { pollCloud(); }, delay);
+  updateSyncSafetyText(null);
+}
+
+async function pollCloud() {
+  pollTimer = null;
+  if (!settings.scriptUrl || settings.autoRefresh === false) return;
+  if (typeof document !== "undefined" && document.hidden) {
+    // Resume when the tab becomes visible again.
+    return;
+  }
+  // Don't yank UI mid-edit.
+  const sinceEdit = Date.now() - lastUserEditAt;
+  if (lastUserEditAt && sinceEdit < POLL_EDIT_DEBOUNCE_MS) {
+    scheduleNextPoll(POLL_EDIT_DEBOUNCE_MS - sinceEdit + 200);
+    return;
+  }
+  if (!autoSyncArmed && settings.lastSeenRevision == null) {
+    scheduleNextPoll();
+    return;
+  }
+
+  let cloud;
+  try {
+    cloud = await fetchCloudInfo();
+  } catch (err) {
+    scheduleNextPoll();
+    return;
+  }
+  updateSyncSafetyText(cloud);
+
+  const cloudRev = cloud.revision;
+  const seen = settings.lastSeenRevision;
+  const cloudAhead =
+    cloud.hasData &&
+    cloudRev != null &&
+    (seen == null || String(cloudRev) !== String(seen));
+
+  if (cloudAhead) {
+    if (localDirty || syncTimer) {
+      // Local has pending edits — try push; conflict UI on failure.
+      await syncNow({ silent: true });
+    } else if (autoSyncArmed || seen != null) {
+      await restoreFromSheet({ skipConfirm: true, fromPoll: true });
+    }
+  }
+
+  scheduleNextPoll();
+}
+
+function onVisibilityForPoll() {
+  if (typeof document === "undefined") return;
+  if (document.hidden) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+    nextPollAt = null;
+    updateSyncSafetyText(null);
+  } else if (settings.scriptUrl && settings.autoRefresh !== false && cloudChecked) {
+    // Immediate cheap check on resume, then resume interval.
+    pollCloud();
+  }
+}
+
 /* ---------------- sync modals + status ---------------- */
+function formatAgo(ts) {
+  if (!ts) return "—";
+  const sec = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (sec < 5) return "just now";
+  if (sec < 60) return sec + "s ago";
+  const min = Math.round(sec / 60);
+  if (min < 60) return min + "m ago";
+  return new Date(ts).toLocaleTimeString();
+}
+
+function formatNextRefresh() {
+  if (settings.autoRefresh === false) return "off";
+  if (typeof document !== "undefined" && document.hidden) return "paused (tab hidden)";
+  if (!nextPollAt) return "—";
+  const sec = Math.max(0, Math.round((nextPollAt - Date.now()) / 1000));
+  if (sec <= 0) return "soon";
+  if (sec < 60) return sec + "s";
+  return Math.ceil(sec / 60) + "m";
+}
+
 function updateSyncSafetyText(cloud) {
   const el = document.getElementById("sync-safety-text");
   if (!el) return;
-  const dev = settings.deviceId ? settings.deviceId.replace(/^dev-/, "") : "—";
-  const seen = settings.lastSeenRevision != null ? settings.lastSeenRevision : "—";
-  let cloudBit = "";
+  const registered = !!settings.deviceId;
+  const pullBit = lastPullAt
+    ? formatAgo(lastPullAt)
+    : (settings.lastSync ? formatAgo(new Date(settings.lastSync).getTime()) : "never");
+  const parts = [
+    registered ? "Device registered" : "Device —",
+    "last pull " + pullBit,
+    "next refresh in " + formatNextRefresh(),
+  ];
+  if (settings.lastSeenRevision != null) parts.push("rev " + settings.lastSeenRevision);
   if (cloud) {
-    if (cloud.legacy) cloudBit = " · cloud: legacy backend (client-side guard only)";
-    else if (cloud.hasData || cloud.revision != null) cloudBit = " · cloud rev " + (cloud.revision != null ? cloud.revision : "?");
-    else cloudBit = " · cloud empty";
+    if (cloud.legacy) parts.push("legacy backend");
+    else if (cloud.hasData || cloud.revision != null) parts.push("cloud rev " + (cloud.revision != null ? cloud.revision : "?"));
+    else parts.push("cloud empty");
   }
-  el.textContent = "Device " + dev + " · last seen rev " + seen + cloudBit;
+  el.textContent = parts.join(" · ");
 }
 
 function openSyncModal(cfg) {
@@ -1447,21 +1621,6 @@ function openSyncModal(cfg) {
 function closeSyncModal() {
   const modal = document.getElementById("sync-modal");
   if (modal) modal.classList.add("hidden");
-}
-
-function showNewDeviceModal(cloud) {
-  const when = cloud && cloud.updatedAt ? new Date(cloud.updatedAt).toLocaleString() : "an earlier session";
-  const revBit = cloud && cloud.revision != null ? " (revision " + cloud.revision + ")" : "";
-  openSyncModal({
-    title: "Cloud data found",
-    body:
-      "<p class=\"muted\">This looks like a new or blank device, and the cloud already has saved habits" + revBit + " from " + when + ".</p>" +
-      "<p class=\"muted\">To protect your data, this device will <b>not</b> upload and overwrite the cloud automatically. Restore the cloud copy to this device first.</p>",
-    buttons: [
-      { label: "Keep local only", cls: "btn-ghost", onClick: () => { closeSyncModal(); setSyncIndicator("warn", "Auto-sync paused — cloud not overwritten"); } },
-      { label: "Restore from cloud", cls: "btn-primary", onClick: async () => { closeSyncModal(); await restoreFromSheet({ skipConfirm: true }); } },
-    ],
-  });
 }
 
 function showConflictModal(cloud, opts) {
@@ -1576,10 +1735,38 @@ document.getElementById("habit-daily-limit").addEventListener("input", e => {
 
 const urlInput = document.getElementById("script-url");
 const autoSyncInput = document.getElementById("auto-sync");
+const autoRefreshInput = document.getElementById("auto-refresh");
+const pollIntervalInput = document.getElementById("poll-interval");
 urlInput.value = settings.scriptUrl;
 autoSyncInput.checked = settings.autoSync;
-urlInput.addEventListener("change", () => { settings.scriptUrl = urlInput.value.trim(); saveSettings(); });
+if (autoRefreshInput) autoRefreshInput.checked = settings.autoRefresh !== false;
+if (pollIntervalInput) {
+  const ms = pollIntervalMs();
+  pollIntervalInput.value = String([15000, 45000, 60000].includes(ms) ? ms : DEFAULT_POLL_MS);
+}
+urlInput.addEventListener("change", async () => {
+  settings.scriptUrl = urlInput.value.trim();
+  saveSettings();
+  autoSyncArmed = false;
+  cloudChecked = false;
+  await initSync();
+});
 autoSyncInput.addEventListener("change", () => { settings.autoSync = autoSyncInput.checked; saveSettings(); });
+if (autoRefreshInput) {
+  autoRefreshInput.addEventListener("change", () => {
+    settings.autoRefresh = autoRefreshInput.checked;
+    saveSettings();
+    if (settings.autoRefresh) startPolling();
+    else stopPolling();
+  });
+}
+if (pollIntervalInput) {
+  pollIntervalInput.addEventListener("change", () => {
+    settings.pollIntervalMs = Number(pollIntervalInput.value) || DEFAULT_POLL_MS;
+    saveSettings();
+    if (settings.autoRefresh !== false) startPolling();
+  });
+}
 
 document.getElementById("btn-sync-now").addEventListener("click", () => syncNow());
 document.getElementById("btn-restore").addEventListener("click", () => restoreFromSheet());
@@ -1599,11 +1786,15 @@ document.getElementById("btn-reset").addEventListener("click", () => {
     saveData();
     // Blank local state must not auto-overwrite the cloud afterwards.
     autoSyncArmed = false;
+    localDirty = false;
     settings.lastSeenRevision = null;
     settings.lastSeenUpdatedAt = null;
     saveSettings();
     render();
-    setSyncIndicator("warn", "Local data cleared — cloud untouched. Restore to re-sync.");
+    setSyncIndicator("warn", "Local data cleared — cloud untouched. Restoring…");
+    // Treat like a new device: pull cloud automatically when URL is set.
+    if (settings.scriptUrl) initSync();
+    else setSyncIndicator("warn", "Local data cleared — cloud untouched. Restore to re-sync.");
   }
 });
 
@@ -1611,6 +1802,13 @@ updateSyncSafetyText(null);
 if (settings.lastSync) {
   setSyncIndicator("ok", "Last synced: " + new Date(settings.lastSync).toLocaleString());
 }
+
+// Keep the "next refresh in …" countdown reasonably fresh.
+setInterval(() => {
+  if (settings.autoRefresh !== false && nextPollAt) updateSyncSafetyText(null);
+}, 5000);
+
+document.addEventListener("visibilitychange", onVisibilityForPoll);
 
 // First launch → seed daily good habits; otherwise persist any migration upgrades
 if (!localStorage.getItem(LS_DATA)) {
@@ -1645,6 +1843,14 @@ render();
 
 // Establish cloud state before auto-sync may fire (fail-safe for new devices).
 initSync();
+
+// Test hooks (sync-tests.js / manual debug). Harmless in production.
+try {
+  window.__ahSync = {
+    pollCloud: () => pollCloud(),
+    getPollState: () => ({ pollTimer, nextPollAt, localDirty, autoSyncArmed, lastSeenRevision: settings.lastSeenRevision }),
+  };
+} catch (e) { /* non-browser */ }
 
 // register the service worker for offline use / installability
 if ("serviceWorker" in navigator) {
