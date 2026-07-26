@@ -52,7 +52,15 @@
 
       <section class="tasks-card" aria-label="Habit list">
         <div class="tasks-card-head">
-          <h2 class="tasks-card-title" id="active-list-title">Atomic Habits</h2>
+          <div class="tasks-card-head-main">
+            <h2 class="tasks-card-title" id="active-list-title">Atomic Habits</h2>
+            <div class="list-day-progress hidden" id="list-day-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+              <div class="list-day-progress-track" aria-hidden="true">
+                <div class="list-day-progress-fill" id="list-day-progress-fill"></div>
+              </div>
+              <span class="list-day-progress-meta" id="list-day-progress-meta"></span>
+            </div>
+          </div>
           <div class="tasks-card-actions">
             <button type="button" class="icon-btn" id="btn-sort-hint" title="My order" aria-label="Sort: My order">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h12M3 12h8M3 18h5" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/><path d="M17 8l3 3-3 3M20 11H11" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/></svg>

@@ -171,7 +171,7 @@ body {
 .list-tab.active {
   color: var(--accent);
 }
-.list-tab.active::after {
+.list-tab.active:not(.has-progress)::after {
   content: "";
   position: absolute;
   left: 10px;
@@ -198,6 +198,32 @@ body {
   background: var(--accent-soft);
   color: var(--accent);
 }
+/* Thin good-habit progress under each list tab */
+.list-tab-progress {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 0;
+  height: 3px;
+  border-radius: 3px 3px 0 0;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  pointer-events: none;
+}
+.list-tab.active .list-tab-progress {
+  background: rgba(138, 180, 248, 0.22);
+}
+.list-tab-progress-fill {
+  display: block;
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.28s ease;
+}
+.list-tab.progress-complete .list-tab-progress-fill {
+  background: #81c995;
+}
 
 /* ============ tasks card ============ */
 .tasks-card {
@@ -212,12 +238,18 @@ body {
 .tasks-card.stats-card { padding-bottom: 14px; }
 .tasks-card-head {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   padding: 14px 14px 10px;
 }
-.tasks-card-title {
+.tasks-card-head-main {
   flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tasks-card-title {
   min-width: 0;
   font-size: 1.05rem;
   font-weight: 500;
@@ -226,10 +258,48 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.list-day-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 220px;
+}
+.list-day-progress.hidden { display: none; }
+.list-day-progress-track {
+  flex: 1;
+  min-width: 0;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+.list-day-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: inherit;
+  background: var(--accent-grad);
+  transition: width 0.28s ease;
+}
+.list-day-progress.progress-complete .list-day-progress-fill {
+  background: linear-gradient(135deg, #81c995, #5bb974);
+}
+.list-day-progress-meta {
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+.list-day-progress.progress-complete .list-day-progress-meta {
+  color: #81c995;
+}
 .tasks-card-actions {
   display: flex;
   align-items: center;
   gap: 2px;
+  flex-shrink: 0;
+  margin-top: -2px;
 }
 .icon-btn {
   width: 36px;

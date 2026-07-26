@@ -272,6 +272,29 @@ function countHabitsInList(listId) {
   return (data.habits || []).filter(h => !h.archived && String(h.listId) === String(listId)).length;
 }
 
+/** Good habits in a list that are scheduled on `date` (bad habits excluded). */
+function goodHabitsForListOnDate(listId, date) {
+  const lid = String(listId);
+  return (data.habits || []).filter(h =>
+    !h.archived &&
+    h.type !== "bad" &&
+    String(h.listId) === lid &&
+    isScheduledOn(h, date)
+  );
+}
+
+/**
+ * Progress of positive habits for a list on a date.
+ * pct = completed / scheduled good habits (0 when none scheduled).
+ */
+function listGoodProgress(listId, date) {
+  const goods = goodHabitsForListOnDate(listId, date);
+  const scheduled = goods.length;
+  const done = goods.filter(h => isChecked(h.id, date)).length;
+  const pct = scheduled ? Math.round((done / scheduled) * 100) : 0;
+  return { done, scheduled, pct };
+}
+
 function nextListSortIndex() {
   let max = -1;
   for (const l of data.lists || []) {
@@ -712,24 +735,45 @@ function renderListTabs() {
   if (!tabsEl) return;
   const lists = sortedLists();
   const activeId = getActiveListId();
+  const date = selectedDate;
   tabsEl.innerHTML = "";
   for (const list of lists) {
     const count = countHabitsInList(list.id);
+    const prog = listGoodProgress(list.id, date);
+    const isActive = String(list.id) === activeId;
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "list-tab" + (String(list.id) === activeId ? " active" : "");
+    btn.className = "list-tab" + (isActive ? " active" : "");
+    if (prog.scheduled > 0) {
+      btn.classList.add("has-progress");
+      if (prog.done >= prog.scheduled) btn.classList.add("progress-complete");
+    }
     btn.setAttribute("role", "tab");
-    btn.setAttribute("aria-selected", String(list.id) === activeId ? "true" : "false");
+    btn.setAttribute("aria-selected", isActive ? "true" : "false");
     btn.dataset.listId = list.id;
+    if (prog.scheduled > 0) {
+      btn.title = `${prog.done} of ${prog.scheduled} good habits done`;
+      btn.setAttribute("aria-label", `${list.name}, ${prog.done} of ${prog.scheduled} good habits done`);
+    }
     const nameSpan = document.createElement("span");
     nameSpan.className = "list-tab-name";
     nameSpan.textContent = list.name;
     btn.appendChild(nameSpan);
-    if (String(list.id) !== activeId && count > 0) {
+    if (!isActive && count > 0) {
       const badge = document.createElement("span");
       badge.className = "list-tab-badge";
       badge.textContent = String(count);
       btn.appendChild(badge);
+    }
+    if (prog.scheduled > 0) {
+      const track = document.createElement("span");
+      track.className = "list-tab-progress";
+      track.setAttribute("aria-hidden", "true");
+      const fill = document.createElement("span");
+      fill.className = "list-tab-progress-fill";
+      fill.style.width = prog.pct + "%";
+      track.appendChild(fill);
+      btn.appendChild(track);
     }
     btn.addEventListener("click", () => setActiveList(list.id));
     tabsEl.appendChild(btn);
@@ -740,6 +784,30 @@ function renderListTabs() {
   if (titleEl) titleEl.textContent = active ? active.name : DEFAULT_LIST_NAME;
   const statsTitle = document.getElementById("stats-list-title");
   if (statsTitle) statsTitle.textContent = (active ? active.name : "Habits") + " · Stats";
+  renderActiveListProgress();
+}
+
+function renderActiveListProgress() {
+  const wrap = document.getElementById("list-day-progress");
+  const fillEl = document.getElementById("list-day-progress-fill");
+  const metaEl = document.getElementById("list-day-progress-meta");
+  if (!wrap || !fillEl || !metaEl) return;
+  const prog = listGoodProgress(getActiveListId(), selectedDate);
+  if (prog.scheduled <= 0) {
+    wrap.classList.add("hidden");
+    wrap.removeAttribute("aria-valuenow");
+    fillEl.style.width = "0%";
+    metaEl.textContent = "";
+    return;
+  }
+  wrap.classList.remove("hidden");
+  wrap.classList.toggle("progress-complete", prog.done >= prog.scheduled);
+  wrap.setAttribute("aria-valuenow", String(prog.pct));
+  wrap.setAttribute("aria-valuemin", "0");
+  wrap.setAttribute("aria-valuemax", "100");
+  wrap.setAttribute("aria-label", `${prog.done} of ${prog.scheduled} good habits completed`);
+  fillEl.style.width = prog.pct + "%";
+  metaEl.textContent = prog.done + "/" + prog.scheduled;
 }
 
 function renderSettingsLists() {
