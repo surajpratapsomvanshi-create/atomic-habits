@@ -612,6 +612,14 @@ body.habit-drag-active * { cursor: grabbing !important; }
   color: var(--text-secondary);
   letter-spacing: 0.01em;
   line-height: 1.3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35em 0.55em;
+}
+.habit-last-used .last-clock {
+  font-weight: 550;
+  color: var(--muted);
 }
 .habit-last-used.never {
   color: var(--muted);

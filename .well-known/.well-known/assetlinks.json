@@ -1,0 +1,8 @@
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "com.atomichabits.tracker",
+        "sha256_cert_fingerprints": ["09:89:69:E6:A9:4C:A7:3F:ED:E6:DF:2B:DC:AF:2B:39:42:E2:DA:AE:ED:4E:5F:64:13:5C:F0:8F:37:7F:B6:3D"]
+      }
+    }]

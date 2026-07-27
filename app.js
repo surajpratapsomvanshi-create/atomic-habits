@@ -652,27 +652,79 @@ function toggleCheck(habitId, date) {
 /* ---------------- punch / last-used timestamps ---------------- */
 const MAX_PUNCHES = 500;
 
-/** Record a clock-time punch. + updates lastUsedAt; − does not. */
+/**
+ * Effective last-used from a punch list: unmatched + punches form a stack;
+ * each − pops one. Returns the top + timestamp or null.
+ */
+function lastUsedAtFromPunchesList(punches, habitId) {
+  const id = String(habitId || "");
+  if (!id || !Array.isArray(punches)) return null;
+  const stack = [];
+  for (const p of punches) {
+    if (!p || String(p.habitId) !== id) continue;
+    const d = Number(p.delta);
+    if (d > 0) stack.push(String(p.at));
+    else if (d < 0 && stack.length) stack.pop();
+  }
+  return stack.length ? stack[stack.length - 1] : null;
+}
+
+function lastUsedAtFromPunches(habitId) {
+  return lastUsedAtFromPunchesList(data.punches, habitId);
+}
+
+/** Keep lastUsedAt[habitId] in sync with the punch stack (or clear it). */
+function syncLastUsedAtFromPunches(habitId) {
+  const id = String(habitId || "");
+  if (!id) return;
+  if (!data.lastUsedAt || typeof data.lastUsedAt !== "object") data.lastUsedAt = {};
+  const iso = lastUsedAtFromPunches(id);
+  if (iso) data.lastUsedAt[id] = iso;
+  else delete data.lastUsedAt[id];
+}
+
+/**
+ * Undo the latest unmatched + punch for a habit (minus button).
+ * Appends a compensating δ=-1 row (sync-safe: merge unions by id, so splicing
+ * would resurrect the + from cloud) and refreshes lastUsedAt from the stack.
+ */
+function undoLatestPlusPunch(habitId) {
+  const id = String(habitId || "");
+  if (!id) return;
+  if (!Array.isArray(data.punches)) data.punches = [];
+  if (lastUsedAtFromPunches(id)) {
+    data.punches.push({
+      id: "p-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      habitId: id,
+      at: new Date().toISOString(),
+      delta: -1,
+    });
+    if (data.punches.length > MAX_PUNCHES) {
+      data.punches = data.punches.slice(-MAX_PUNCHES);
+    }
+  }
+  syncLastUsedAtFromPunches(id);
+}
+
+/** Record a clock-time + punch and set lastUsedAt to now. */
 function recordPunch(habitId, delta) {
   const id = String(habitId || "");
   if (!id) return;
   const d = Number(delta);
-  if (!Number.isFinite(d) || d === 0) return;
+  if (!Number.isFinite(d) || d <= 0) return;
   const at = new Date().toISOString();
   if (!Array.isArray(data.punches)) data.punches = [];
   data.punches.push({
     id: "p-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     habitId: id,
     at,
-    delta: d > 0 ? 1 : -1,
+    delta: 1,
   });
   if (data.punches.length > MAX_PUNCHES) {
     data.punches = data.punches.slice(-MAX_PUNCHES);
   }
-  if (d > 0) {
-    if (!data.lastUsedAt || typeof data.lastUsedAt !== "object") data.lastUsedAt = {};
-    data.lastUsedAt[id] = at;
-  }
+  if (!data.lastUsedAt || typeof data.lastUsedAt !== "object") data.lastUsedAt = {};
+  data.lastUsedAt[id] = at;
 }
 
 function getLastUsedAt(habitId) {
@@ -682,18 +734,34 @@ function getLastUsedAt(habitId) {
   return iso ? String(iso) : null;
 }
 
-/** Relative label from an ISO timestamp, e.g. "2h ago", "1d ago", "Just now". */
+/**
+ * Relative label from an ISO timestamp.
+ * "Just now" only under 30s so rapid +/− undos are distinguishable.
+ */
 function formatLastUsedAgo(iso) {
   if (!iso) return null;
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return null;
-  const mins = Math.max(0, Math.floor((Date.now() - t) / 60000));
-  if (mins < 1) return "Just now";
+  const sec = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (sec < 30) return "Just now";
+  if (sec < 60) return sec + "s ago";
+  const mins = Math.floor(sec / 60);
   if (mins < 60) return mins + "m ago";
   const hours = Math.floor(mins / 60);
   if (hours < 24) return hours + "h ago";
   const days = Math.floor(hours / 24);
   return days + "d ago";
+}
+
+/** Local clock time for a last-used ISO (e.g. "6:41 PM"). */
+function formatLastUsedClock(iso) {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "";
+  return new Date(t).toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 function laterIso(a, b) {
@@ -742,8 +810,8 @@ function incrementCount(habitId, date) {
 function decrementCount(habitId, date) {
   const cur = getCount(habitId, date);
   if (cur <= 0) return;
-  // Log the − punch for sync history, but do not reset lastUsedAt.
-  recordPunch(habitId, -1);
+  // Undo the latest + punch so lastUsedAt moves to the previous punch (or clears).
+  undoLatestPlusPunch(habitId);
   setCount(habitId, date, cur - 1);
 }
 
@@ -1091,8 +1159,9 @@ function renderBadHabitCard(h) {
     : `<span class="habit-pill avg pending">Avg pending</span>`;
   const lastIso = getLastUsedAt(h.id);
   const lastLabel = formatLastUsedAgo(lastIso);
+  const lastClock = formatLastUsedClock(lastIso);
   const lastUsedHtml = lastLabel
-    ? `<div class="habit-last-used" title="${lastIso || ""}">${lastLabel}</div>`
+    ? `<div class="habit-last-used" title="${lastIso || ""}"><span class="last-rel">${lastLabel}</span>${lastClock ? `<span class="last-clock">${lastClock}</span>` : ""}</div>`
     : `<div class="habit-last-used never">Not used yet</div>`;
 
   const alertHtml = [
@@ -1819,7 +1888,9 @@ function dataHasHabits(d) {
 /**
  * Merge local pending edits onto cloud (source of truth base):
  * lists + habits by id (cloud wins on same id), checks union, counts take max,
- * lastUsedAt takes later timestamp per habit, punches union by id.
+ * punches union by id; lastUsedAt is derived from the merged punch stack
+ * (so − undos win over a stale later map value). Legacy map-only habits
+ * (no punches) still take the later timestamp.
  * Returns null if merge isn't cleanly possible.
  */
 function mergeHabitData(localData, cloudData) {
@@ -1896,19 +1967,6 @@ function mergeHabitData(localData, cloudData) {
     if (Object.keys(row).length) counts[day] = row;
   }
 
-  const lastUsedAt = {};
-  const usedIds = new Set([
-    ...Object.keys(cld.lastUsedAt || {}),
-    ...Object.keys(loc.lastUsedAt || {}),
-  ]);
-  for (const id of usedIds) {
-    const later = laterIso(
-      (cld.lastUsedAt && cld.lastUsedAt[id]) || null,
-      (loc.lastUsedAt && loc.lastUsedAt[id]) || null
-    );
-    if (later) lastUsedAt[id] = later;
-  }
-
   const punchById = new Map();
   for (const p of [...(cld.punches || []), ...(loc.punches || [])]) {
     if (!p || !p.id) continue;
@@ -1918,6 +1976,28 @@ function mergeHabitData(localData, cloudData) {
   let punches = Array.from(punchById.values());
   punches.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
   if (punches.length > MAX_PUNCHES) punches = punches.slice(-MAX_PUNCHES);
+
+  const lastUsedAt = {};
+  const usedIds = new Set([
+    ...Object.keys(cld.lastUsedAt || {}),
+    ...Object.keys(loc.lastUsedAt || {}),
+    ...punches.map(p => String(p.habitId)),
+  ]);
+  for (const id of usedIds) {
+    const fromStack = lastUsedAtFromPunchesList(punches, id);
+    if (fromStack) {
+      lastUsedAt[id] = fromStack;
+      continue;
+    }
+    // Stack empty with punches for this habit → undos canceled all +; clear.
+    const hadPunches = punches.some(p => p && String(p.habitId) === id);
+    if (hadPunches) continue;
+    const later = laterIso(
+      (cld.lastUsedAt && cld.lastUsedAt[id]) || null,
+      (loc.lastUsedAt && loc.lastUsedAt[id]) || null
+    );
+    if (later) lastUsedAt[id] = later;
+  }
 
   let activeListId = loc.activeListId || cld.activeListId || fallbackListId;
   if (!listIds.has(String(activeListId))) activeListId = fallbackListId;
