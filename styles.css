@@ -625,6 +625,15 @@ body.habit-drag-active * { cursor: grabbing !important; }
   color: var(--muted);
   font-weight: 600;
 }
+.habit-use-times {
+  margin-top: 6px;
+  font-size: 0.62rem;
+  font-weight: 550;
+  color: var(--muted);
+  letter-spacing: 0.015em;
+  line-height: 1.45;
+  word-break: break-word;
+}
 
 .habit-check {
   width: 38px;

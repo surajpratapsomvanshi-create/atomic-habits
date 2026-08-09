@@ -711,14 +711,37 @@ const MAX_PUNCHES = 500;
 function lastUsedAtFromPunchesList(punches, habitId) {
   const id = String(habitId || "");
   if (!id || !Array.isArray(punches)) return null;
+  const stack = unmatchedPlusStack(punches, id);
+  return stack.length ? stack[stack.length - 1].at : null;
+}
+
+/**
+ * Unmatched + punches for a habit (chronological stack; each − pops one).
+ * Returns [{ at, day }, ...] still on the stack after all undos.
+ */
+function unmatchedPlusStack(punches, habitId) {
+  const id = String(habitId || "");
+  if (!id || !Array.isArray(punches)) return [];
   const stack = [];
   for (const p of punches) {
     if (!p || String(p.habitId) !== id) continue;
     const d = Number(p.delta);
-    if (d > 0) stack.push(String(p.at));
-    else if (d < 0 && stack.length) stack.pop();
+    if (d > 0) {
+      stack.push({ at: String(p.at), day: punchDay(p) });
+    } else if (d < 0 && stack.length) {
+      stack.pop();
+    }
   }
-  return stack.length ? stack[stack.length - 1] : null;
+  return stack;
+}
+
+/** Clock times of unmatched + punches for habitId on calendar day (count key). */
+function useTimesForDay(habitId, day) {
+  const dayKey = day && /^\d{4}-\d{2}-\d{2}$/.test(String(day)) ? String(day) : "";
+  if (!dayKey) return [];
+  return unmatchedPlusStack(data.punches, habitId)
+    .filter(x => x.day === dayKey)
+    .map(x => x.at);
 }
 
 function lastUsedAtFromPunches(habitId) {
@@ -1225,6 +1248,12 @@ function renderBadHabitCard(h) {
   const lastUsedHtml = lastLabel
     ? `<div class="habit-last-used" title="${lastIso || ""}"><span class="last-rel">${lastLabel}</span>${lastClock ? `<span class="last-clock">${lastClock}</span>` : ""}</div>`
     : `<div class="habit-last-used never">Not used yet</div>`;
+  const dayUseClocks = useTimesForDay(h.id, selectedDate)
+    .map(formatLastUsedClock)
+    .filter(Boolean);
+  const useTimesHtml = dayUseClocks.length
+    ? `<div class="habit-use-times" aria-label="Use times"></div>`
+    : "";
 
   const alertHtml = [
     ...warnings.map(() => `<div class="habit-warn" role="alert"></div>`),
@@ -1243,6 +1272,7 @@ function renderBadHabitCard(h) {
        </div>
        ${lastUsedHtml}
        ${alertHtml ? `<div class="habit-alerts">${alertHtml}</div>` : ""}
+       ${useTimesHtml}
      </div>` +
     `<button class="habit-edit" title="Edit" type="button" aria-label="Edit habit">${EDIT_ICON}</button>` +
     `<div class="counter-controls" role="group" aria-label="Counter">
@@ -1254,6 +1284,8 @@ function renderBadHabitCard(h) {
   card.querySelector(".habit-pill.schedule").textContent = scheduleLabel(h);
   card.querySelectorAll(".habit-warn").forEach((el, i) => { el.textContent = warnings[i]; });
   card.querySelectorAll(".habit-tip").forEach((el, i) => { el.textContent = tips[i]; });
+  const useTimesEl = card.querySelector(".habit-use-times");
+  if (useTimesEl) useTimesEl.textContent = dayUseClocks.join(" · ");
   if (overLimit) {
     const val = card.querySelector(".counter-value");
     val.classList.add("over");
@@ -2933,6 +2965,8 @@ try {
     markDirty: () => { localDirty = true; },
     mergeHabitData,
     punchDay,
+    unmatchedPlusStack,
+    useTimesForDay,
     applyCountDelta,
     migrateData,
     createList,
