@@ -187,6 +187,7 @@ function migrateData(raw) {
   const counts = raw.counts && typeof raw.counts === "object" ? raw.counts : {};
   const lastUsedAt = migrateLastUsedAt(raw.lastUsedAt);
   const punches = migratePunches(raw.punches);
+  reconcileLastUsedAtFromPunches(lastUsedAt, punches);
   let activeListId = raw.activeListId != null ? String(raw.activeListId) : fallbackListId;
   if (!listIds.has(activeListId)) activeListId = fallbackListId;
   return { habits, checks, counts, lastUsedAt, punches, lists, activeListId };
@@ -220,14 +221,65 @@ function migratePunches(raw) {
     if (!Number.isFinite(t)) continue;
     const delta = Number(p.delta);
     if (!Number.isFinite(delta) || delta === 0) continue;
+    const isoAt = new Date(t).toISOString();
+    const dayRaw = p.day != null ? String(p.day).trim() : "";
+    const day = /^\d{4}-\d{2}-\d{2}$/.test(dayRaw)
+      ? dayRaw
+      : dateStr(new Date(t));
     out.push({
       id: String(p.id || ("p-" + t.toString(36))),
       habitId,
-      at: new Date(t).toISOString(),
+      at: isoAt,
       delta: delta > 0 ? 1 : -1,
+      day,
     });
   }
   return out;
+}
+
+/** Calendar day a punch applies to (count key). Prefer explicit day. */
+function punchDay(p) {
+  if (!p) return null;
+  const dayRaw = p.day != null ? String(p.day).trim() : "";
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dayRaw)) return dayRaw;
+  const t = Date.parse(p.at);
+  if (!Number.isFinite(t)) return null;
+  return dateStr(new Date(t));
+}
+
+/** Re-derive lastUsedAt from punch stacks so map never drifts from undos. */
+function reconcileLastUsedAtFromPunches(lastUsedAt, punches) {
+  if (!lastUsedAt || typeof lastUsedAt !== "object") return lastUsedAt;
+  if (!Array.isArray(punches) || !punches.length) return lastUsedAt;
+  const ids = new Set();
+  for (const p of punches) {
+    if (p && p.habitId != null) ids.add(String(p.habitId));
+  }
+  for (const id of ids) {
+    const iso = lastUsedAtFromPunchesList(punches, id);
+    if (iso) lastUsedAt[id] = iso;
+    else delete lastUsedAt[id];
+  }
+  return lastUsedAt;
+}
+
+/**
+ * Apply a signed delta to counts[day][habitId], clamping at 0.
+ * Used when merging local-only punches onto a cloud counts base.
+ */
+function applyCountDelta(counts, day, habitId, delta) {
+  const d = String(day || "");
+  const id = String(habitId || "");
+  const nDelta = Number(delta);
+  if (!d || !id || !Number.isFinite(nDelta) || nDelta === 0) return;
+  if (!counts[d]) counts[d] = {};
+  const next = Math.max(0, (Number(counts[d][id]) || 0) + nDelta);
+  if (next === 0) {
+    delete counts[d][id];
+    if (!Object.keys(counts[d]).length) delete counts[d];
+  } else {
+    counts[d][id] = next;
+  }
 }
 
 function migrateHabit(h, fallbackListId, listIds) {
@@ -637,7 +689,7 @@ function toggleCheck(habitId, date) {
   if (i >= 0) list.splice(i, 1);
   else {
     list.push(habitId);
-    recordPunch(habitId, 1);
+    recordPunch(habitId, 1, date);
   }
   if (list.length === 0) delete data.checks[date];
   // Flag so the re-render can play the satisfying tick animation once
@@ -687,17 +739,23 @@ function syncLastUsedAtFromPunches(habitId) {
  * Undo the latest unmatched + punch for a habit (minus button).
  * Appends a compensating δ=-1 row (sync-safe: merge unions by id, so splicing
  * would resurrect the + from cloud) and refreshes lastUsedAt from the stack.
+ * `day` is the counts key being decremented (selected date).
  */
-function undoLatestPlusPunch(habitId) {
+function undoLatestPlusPunch(habitId, day) {
   const id = String(habitId || "");
   if (!id) return;
   if (!Array.isArray(data.punches)) data.punches = [];
   if (lastUsedAtFromPunches(id)) {
+    const at = new Date().toISOString();
+    const dayKey = day && /^\d{4}-\d{2}-\d{2}$/.test(String(day))
+      ? String(day)
+      : todayStr();
     data.punches.push({
       id: "p-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       habitId: id,
-      at: new Date().toISOString(),
+      at,
       delta: -1,
+      day: dayKey,
     });
     if (data.punches.length > MAX_PUNCHES) {
       data.punches = data.punches.slice(-MAX_PUNCHES);
@@ -706,19 +764,23 @@ function undoLatestPlusPunch(habitId) {
   syncLastUsedAtFromPunches(id);
 }
 
-/** Record a clock-time + punch and set lastUsedAt to now. */
-function recordPunch(habitId, delta) {
+/** Record a clock-time + punch and set lastUsedAt to now. `day` = counts key. */
+function recordPunch(habitId, delta, day) {
   const id = String(habitId || "");
   if (!id) return;
   const d = Number(delta);
   if (!Number.isFinite(d) || d <= 0) return;
   const at = new Date().toISOString();
+  const dayKey = day && /^\d{4}-\d{2}-\d{2}$/.test(String(day))
+    ? String(day)
+    : todayStr();
   if (!Array.isArray(data.punches)) data.punches = [];
   data.punches.push({
     id: "p-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     habitId: id,
     at,
     delta: 1,
+    day: dayKey,
   });
   if (data.punches.length > MAX_PUNCHES) {
     data.punches = data.punches.slice(-MAX_PUNCHES);
@@ -803,7 +865,7 @@ function setCount(habitId, date, value) {
 }
 
 function incrementCount(habitId, date) {
-  recordPunch(habitId, 1);
+  recordPunch(habitId, 1, date);
   setCount(habitId, date, getCount(habitId, date) + 1);
 }
 
@@ -811,7 +873,7 @@ function decrementCount(habitId, date) {
   const cur = getCount(habitId, date);
   if (cur <= 0) return;
   // Undo the latest + punch so lastUsedAt moves to the previous punch (or clears).
-  undoLatestPlusPunch(habitId);
+  undoLatestPlusPunch(habitId, date);
   setCount(habitId, date, cur - 1);
 }
 
@@ -1887,10 +1949,12 @@ function dataHasHabits(d) {
 
 /**
  * Merge local pending edits onto cloud (source of truth base):
- * lists + habits by id (cloud wins on same id), checks union, counts take max,
+ * lists + habits by id (cloud wins on same id), checks union,
+ * counts = cloud base + local-only punch deltas (so − undos survive;
+ * Math.max alone wrongly kept the higher pre-undo count),
  * punches union by id; lastUsedAt is derived from the merged punch stack
  * (so − undos win over a stale later map value). Legacy map-only habits
- * (no punches) still take the later timestamp.
+ * (no punches) still take the later timestamp / max count.
  * Returns null if merge isn't cleanly possible.
  */
 function mergeHabitData(localData, cloudData) {
@@ -1951,22 +2015,6 @@ function mergeHabitData(localData, cloudData) {
     if (set.size) checks[day] = Array.from(set);
   }
 
-  const counts = {};
-  const countDates = new Set([
-    ...Object.keys(cld.counts || {}),
-    ...Object.keys(loc.counts || {}),
-  ]);
-  for (const day of countDates) {
-    const a = (cld.counts && cld.counts[day]) || {};
-    const b = (loc.counts && loc.counts[day]) || {};
-    const ids = new Set([...Object.keys(a), ...Object.keys(b)]);
-    const row = {};
-    for (const id of ids) {
-      row[id] = Math.max(Number(a[id]) || 0, Number(b[id]) || 0);
-    }
-    if (Object.keys(row).length) counts[day] = row;
-  }
-
   const punchById = new Map();
   for (const p of [...(cld.punches || []), ...(loc.punches || [])]) {
     if (!p || !p.id) continue;
@@ -1976,6 +2024,53 @@ function mergeHabitData(localData, cloudData) {
   let punches = Array.from(punchById.values());
   punches.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
   if (punches.length > MAX_PUNCHES) punches = punches.slice(-MAX_PUNCHES);
+
+  // Counts: start from cloud, apply deltas from punches only present locally.
+  // Math.max alone drops undos when the other device still has the higher count.
+  const cloudPunchIds = new Set(
+    (cld.punches || []).filter(p => p && p.id).map(p => String(p.id))
+  );
+  const counts = {};
+  for (const day of Object.keys(cld.counts || {})) {
+    const row = cld.counts[day] || {};
+    const copy = {};
+    for (const id of Object.keys(row)) {
+      const n = Number(row[id]) || 0;
+      if (n > 0) copy[id] = n;
+    }
+    if (Object.keys(copy).length) counts[day] = copy;
+  }
+  const localOnlyPunchKeys = new Set(); // day\0habitId touched by local-only punches
+  for (const p of loc.punches || []) {
+    if (!p || !p.id || cloudPunchIds.has(String(p.id))) continue;
+    const day = punchDay(p);
+    if (!day) continue;
+    localOnlyPunchKeys.add(day + "\0" + String(p.habitId));
+    applyCountDelta(counts, day, p.habitId, p.delta);
+  }
+  // Legacy / backfill: days with no local-only punches take max(cloud, local).
+  const countDates = new Set([
+    ...Object.keys(cld.counts || {}),
+    ...Object.keys(loc.counts || {}),
+  ]);
+  for (const day of countDates) {
+    const a = (cld.counts && cld.counts[day]) || {};
+    const b = (loc.counts && loc.counts[day]) || {};
+    const ids = new Set([...Object.keys(a), ...Object.keys(b)]);
+    for (const id of ids) {
+      if (localOnlyPunchKeys.has(day + "\0" + String(id))) continue;
+      const max = Math.max(Number(a[id]) || 0, Number(b[id]) || 0);
+      if (max <= 0) {
+        if (counts[day]) {
+          delete counts[day][id];
+          if (!Object.keys(counts[day]).length) delete counts[day];
+        }
+        continue;
+      }
+      if (!counts[day]) counts[day] = {};
+      counts[day][id] = max;
+    }
+  }
 
   const lastUsedAt = {};
   const usedIds = new Set([
@@ -2837,6 +2932,8 @@ try {
     getPollState: () => ({ pollTimer, nextPollAt, localDirty, autoSyncArmed, lastSeenRevision: settings.lastSeenRevision }),
     markDirty: () => { localDirty = true; },
     mergeHabitData,
+    punchDay,
+    applyCountDelta,
     migrateData,
     createList,
     renameList,
