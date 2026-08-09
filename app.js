@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "31";
+const APP_VERSION = "32";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -1246,7 +1246,7 @@ function fillUseTimeline(listEl, clocks) {
   listEl.appendChild(frag);
 }
 
-/** Fill a compare row: chips when present, muted empty state otherwise. */
+/** Fill a compare row: chips when present, clear empty state otherwise. */
 function fillUseCompareRow(rowEl, clocks) {
   if (!rowEl) return;
   const scroll = rowEl.querySelector(".use-times-scroll");
@@ -1256,8 +1256,34 @@ function fillUseCompareRow(rowEl, clocks) {
   const has = Array.isArray(clocks) && clocks.length > 0;
   list.classList.toggle("hidden", !has);
   empty.classList.toggle("hidden", has);
-  if (has) fillUseTimeline(list, clocks);
-  else list.replaceChildren();
+  if (has) {
+    fillUseTimeline(list, clocks);
+    // Keep latest chip in view — early times alone looked like an empty rail.
+    requestAnimationFrame(() => {
+      scroll.scrollLeft = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
+    });
+  } else {
+    list.replaceChildren();
+    empty.textContent = "No uses";
+  }
+}
+
+/** Label + count badge for a compare row (e.g. "Today · 6"). */
+function setUseCompareLabel(rowEl, dayLabel, count) {
+  if (!rowEl) return;
+  const lab = rowEl.querySelector(".use-times-day-label");
+  if (!lab) return;
+  lab.replaceChildren();
+  const name = document.createElement("span");
+  name.className = "use-times-day-name";
+  name.textContent = dayLabel || "";
+  lab.appendChild(name);
+  const n = Math.max(0, Math.floor(Number(count) || 0));
+  const badge = document.createElement("span");
+  badge.className = "use-times-count";
+  badge.textContent = " · " + n;
+  lab.appendChild(badge);
+  lab.setAttribute("title", (dayLabel || "Day") + ": " + n + (n === 1 ? " use" : " uses"));
 }
 
 function laterIso(a, b) {
@@ -1739,13 +1765,11 @@ function renderBadHabitCard(h) {
     const selRow = card.querySelector('.use-times-day[data-role="selected"]');
     const prevRow = card.querySelector('.use-times-day[data-role="prev"]');
     if (selRow) {
-      const lab = selRow.querySelector(".use-times-day-label");
-      if (lab) lab.textContent = selLabel;
+      setUseCompareLabel(selRow, selLabel, dayUseClocks.length || dayView.count || 0);
       fillUseCompareRow(selRow, dayUseClocks);
     }
     if (prevRow) {
-      const lab = prevRow.querySelector(".use-times-day-label");
-      if (lab) lab.textContent = prevLabel;
+      setUseCompareLabel(prevRow, prevLabel, prevUseClocks.length || prevView.count || 0);
       fillUseCompareRow(prevRow, prevUseClocks);
     }
   }
