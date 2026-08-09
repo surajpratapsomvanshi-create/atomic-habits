@@ -644,36 +644,64 @@ body.habit-drag-active * { cursor: grabbing !important; }
   color: var(--muted);
   font-weight: 600;
 }
-/* Bad-habit use times: simple vertical list — one row per use (always visible) */
+/* Bad-habit use times: wrapping chip rail — every use visible, no scroll clip */
 .habit-use-times {
   margin-top: 8px;
   max-width: 100%;
+  padding: 7px 8px;
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(138, 180, 248, 0.07), rgba(255, 255, 255, 0.02)),
+    var(--surface-2);
+  border: 1px solid rgba(138, 180, 248, 0.12);
 }
 .use-times-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
-  flex-direction: column;
-  gap: 3px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
 }
 .use-time-row {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  min-height: 1.15em;
-  padding: 1px 0;
+  justify-content: center;
+  margin: 0;
+  padding: 0;
+  flex: 0 0 auto;
 }
 .use-time-clock {
-  font-size: 0.72rem;
-  font-weight: 600;
-  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2.85em;
+  padding: 3px 7px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 650;
   letter-spacing: 0.02em;
-  line-height: 1.2;
+  line-height: 1.25;
   font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
 }
 .use-time-row.latest .use-time-clock {
-  color: var(--accent-2);
-  font-weight: 700;
+  color: #102040;
+  font-weight: 750;
+  background: var(--accent-grad);
+  border-color: transparent;
+  box-shadow: 0 1px 6px rgba(102, 157, 246, 0.28);
+  animation: useChipIn 0.38s ease-out;
+}
+@keyframes useChipIn {
+  from { transform: scale(0.92); opacity: 0.55; }
+  to { transform: scale(1); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .use-time-row.latest .use-time-clock { animation: none; }
 }
 
 .habit-check {

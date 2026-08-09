@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "29";
+const APP_VERSION = "30";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -1213,7 +1213,7 @@ function formatLastUsedClock(iso) {
   return hh + ":" + mm;
 }
 
-/** Build the bad-habit use-times list (one visible row per use; text-safe). */
+/** Build the bad-habit use-times chip row (one visible pill per use; text-safe). */
 function fillUseTimeline(listEl, clocks) {
   if (!listEl || !clocks || !clocks.length) return;
   const frag = document.createDocumentFragment();
@@ -1223,6 +1223,8 @@ function fillUseTimeline(listEl, clocks) {
     li.className = "use-time-row" + (i === last ? " latest" : "");
     const time = document.createElement("time");
     time.className = "use-time-clock";
+    time.setAttribute("datetime", clock);
+    time.setAttribute("title", i === last ? "Latest · " + clock : clock);
     time.textContent = clock;
     li.appendChild(time);
     frag.appendChild(li);
@@ -1649,7 +1651,7 @@ function renderBadHabitCard(h) {
     : `<div class="habit-last-used never">Not used yet</div>`;
   const dayUseClocks = dayUseAts.map(formatLastUsedClock).filter(Boolean);
   const useTimesHtml = dayUseClocks.length
-    ? `<div class="habit-use-times" aria-label="Use times"><ol class="use-times-list"></ol></div>`
+    ? `<div class="habit-use-times" aria-label="Use times (${dayUseClocks.length})"><ol class="use-times-list"></ol></div>`
     : "";
 
   const alertHtml = [
