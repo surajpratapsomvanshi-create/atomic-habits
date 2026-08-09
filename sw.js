@@ -1,4 +1,4 @@
-const CACHE = "atomic-habits-v28";
+const CACHE = "atomic-habits-v29";
 const ASSETS = [
   "./",
   "./index.html",
@@ -14,9 +14,11 @@ self.addEventListener("install", e => {
 });
 
 self.addEventListener("activate", e => {
+  // Wipe every cache (not only the previous CACHE name), then reseed current.
   e.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+      .then(keys => Promise.all(keys.map(k => caches.delete(k))))
+      .then(() => caches.open(CACHE).then(c => c.addAll(ASSETS)))
       .then(() => self.clients.claim())
   );
 });
@@ -41,7 +43,7 @@ self.addEventListener("fetch", e => {
   if (e.request.url.includes("script.google.com")) return;
   if (e.request.method !== "GET") return;
 
-  // Network-first for app shell so v28+ logic reaches phones stuck on old caches.
+  // Network-first for app shell so new logic reaches phones stuck on old caches.
   if (isShellRequest(e.request.url) || e.request.mode === "navigate") {
     e.respondWith(
       fetch(e.request, { cache: "no-store" })

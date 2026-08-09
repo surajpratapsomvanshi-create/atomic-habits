@@ -24,9 +24,10 @@
 
 const LS_DATA = "ah.data";
 const LS_SETTINGS = "ah.settings";
+const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "28";
+const APP_VERSION = "29";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -3388,8 +3389,51 @@ try {
   };
 } catch (e) { /* non-browser */ }
 
+async function forceAppUpdateReload() {
+  try {
+    if ("serviceWorker" in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    }
+  } catch (_) { /* ignore */ }
+  try {
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(
+        keys
+          .filter(k => k.indexOf("atomic-habits-") === 0)
+          .map(k => caches.delete(k))
+      );
+    }
+  } catch (_) { /* ignore */ }
+  try { localStorage.setItem(LS_APP_VERSION, APP_VERSION); } catch (_) { /* ignore */ }
+  location.reload(true);
+}
+
+function showUpdateBanner() {
+  if (document.getElementById("app-update-banner")) return;
+  const el = document.createElement("button");
+  el.id = "app-update-banner";
+  el.type = "button";
+  el.className = "app-update-banner";
+  el.textContent = "Update available — Tap to reload";
+  el.addEventListener("click", () => { forceAppUpdateReload(); });
+  document.body.insertBefore(el, document.body.firstChild);
+}
+
+try {
+  const storedVer = localStorage.getItem(LS_APP_VERSION);
+  if (storedVer !== APP_VERSION) showUpdateBanner();
+} catch (_) { /* ignore */ }
+
 // register the service worker for offline use / installability
 if ("serviceWorker" in navigator) {
+  let refreshing = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (refreshing) return;
+    refreshing = true;
+    location.reload();
+  });
   navigator.serviceWorker
     .register("sw.js", { updateViaCache: "none" })
     .then(reg => { try { reg.update(); } catch (_) { /* ignore */ } })
@@ -3399,4 +3443,8 @@ if ("serviceWorker" in navigator) {
 try {
   const verEl = document.getElementById("app-version-label");
   if (verEl) verEl.textContent = "App version " + APP_VERSION;
+} catch (_) { /* ignore */ }
+
+try {
+  localStorage.setItem(LS_APP_VERSION, APP_VERSION);
 } catch (_) { /* ignore */ }
