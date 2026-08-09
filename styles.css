@@ -644,25 +644,76 @@ body.habit-drag-active * { cursor: grabbing !important; }
   color: var(--muted);
   font-weight: 600;
 }
-/* Bad-habit use times: wrapping chip rail — every use visible, no scroll clip */
+/* Bad-habit use times: Today vs previous day — two horizontal chip rails */
 .habit-use-times {
   margin-top: 8px;
   max-width: 100%;
   padding: 7px 8px;
   border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   background:
     linear-gradient(180deg, rgba(138, 180, 248, 0.07), rgba(255, 255, 255, 0.02)),
     var(--surface-2);
   border: 1px solid rgba(138, 180, 248, 0.12);
 }
+.use-times-day {
+  display: grid;
+  grid-template-columns: 4.6rem minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.use-times-day-label {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.use-times-day[data-role="selected"] .use-times-day-label {
+  color: var(--text-secondary);
+}
+.use-times-scroll {
+  position: relative;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(138, 180, 248, 0.35) transparent;
+  mask-image: linear-gradient(90deg, #000 0%, #000 calc(100% - 16px), transparent);
+  -webkit-mask-image: linear-gradient(90deg, #000 0%, #000 calc(100% - 16px), transparent);
+}
+.use-times-scroll::-webkit-scrollbar {
+  height: 3px;
+}
+.use-times-scroll::-webkit-scrollbar-thumb {
+  background: rgba(138, 180, 248, 0.35);
+  border-radius: 999px;
+}
 .use-times-list {
   list-style: none;
   margin: 0;
-  padding: 0;
+  padding: 1px 14px 1px 0;
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 6px;
+  width: max-content;
+}
+.use-times-empty {
+  display: inline-block;
+  font-size: 0.66rem;
+  font-weight: 550;
+  color: var(--muted);
+  opacity: 0.72;
+  padding: 2px 0;
+  white-space: nowrap;
 }
 .use-time-row {
   display: inline-flex;
@@ -695,6 +746,14 @@ body.habit-drag-active * { cursor: grabbing !important; }
   border-color: transparent;
   box-shadow: 0 1px 6px rgba(102, 157, 246, 0.28);
   animation: useChipIn 0.38s ease-out;
+}
+.use-times-day[data-role="prev"] .use-time-row.latest .use-time-clock {
+  color: var(--text-secondary);
+  font-weight: 700;
+  background: rgba(138, 180, 248, 0.16);
+  border-color: rgba(138, 180, 248, 0.28);
+  box-shadow: none;
+  animation: none;
 }
 @keyframes useChipIn {
   from { transform: scale(0.92); opacity: 0.55; }

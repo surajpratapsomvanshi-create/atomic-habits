@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "30";
+const APP_VERSION = "31";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -1213,9 +1213,23 @@ function formatLastUsedClock(iso) {
   return hh + ":" + mm;
 }
 
-/** Build the bad-habit use-times chip row (one visible pill per use; text-safe). */
+/** Short label for use-times compare rows: Today / Yesterday / "Sun 9". */
+function useCompareDayLabel(day) {
+  const dayKey = day && /^\d{4}-\d{2}-\d{2}$/.test(String(day)) ? String(day) : "";
+  if (!dayKey) return "";
+  const today = todayStr();
+  if (dayKey === today) return "Today";
+  if (dayKey === addDays(today, -1)) return "Yesterday";
+  const [y, m, d] = dayKey.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  return DOW_LABELS[dt.getDay()] + " " + d;
+}
+
+/** Build one horizontal use-times chip row (one pill per use; text-safe). */
 function fillUseTimeline(listEl, clocks) {
-  if (!listEl || !clocks || !clocks.length) return;
+  if (!listEl) return;
+  listEl.replaceChildren();
+  if (!clocks || !clocks.length) return;
   const frag = document.createDocumentFragment();
   const last = clocks.length - 1;
   clocks.forEach((clock, i) => {
@@ -1230,6 +1244,20 @@ function fillUseTimeline(listEl, clocks) {
     frag.appendChild(li);
   });
   listEl.appendChild(frag);
+}
+
+/** Fill a compare row: chips when present, muted empty state otherwise. */
+function fillUseCompareRow(rowEl, clocks) {
+  if (!rowEl) return;
+  const scroll = rowEl.querySelector(".use-times-scroll");
+  const list = rowEl.querySelector(".use-times-list");
+  const empty = rowEl.querySelector(".use-times-empty");
+  if (!scroll || !list || !empty) return;
+  const has = Array.isArray(clocks) && clocks.length > 0;
+  list.classList.toggle("hidden", !has);
+  empty.classList.toggle("hidden", has);
+  if (has) fillUseTimeline(list, clocks);
+  else list.replaceChildren();
 }
 
 function laterIso(a, b) {
@@ -1613,11 +1641,16 @@ function renderGoodHabitCard(h) {
 }
 
 function renderBadHabitCard(h) {
-  // Heal this habit/day if count, punch times, or lastUsedAt disagree.
-  if (dayViewDrift(h.id, selectedDate) && healDataDrift()) saveData();
+  const prevDate = addDays(selectedDate, -1);
+  // Heal selected + previous day if count, punch times, or lastUsedAt disagree.
+  if (
+    (dayViewDrift(h.id, selectedDate) || dayViewDrift(h.id, prevDate))
+    && healDataDrift()
+  ) saveData();
 
   // One array drives count, timeline, and last-used clock — they cannot diverge.
   const dayView = badDayView(h.id, selectedDate);
+  const prevView = badDayView(h.id, prevDate);
   const dayUseAts = dayView.ats;
   const count = dayView.count;
   const { avg, samples } = historicalAverage(h.id, selectedDate);
@@ -1650,8 +1683,27 @@ function renderBadHabitCard(h) {
     ? `<div class="habit-last-used" title="${lastIso || ""}"><span class="last-rel">${lastLabel}</span>${lastClock ? `<span class="last-clock">${lastClock}</span>` : ""}</div>`
     : `<div class="habit-last-used never">Not used yet</div>`;
   const dayUseClocks = dayUseAts.map(formatLastUsedClock).filter(Boolean);
-  const useTimesHtml = dayUseClocks.length
-    ? `<div class="habit-use-times" aria-label="Use times (${dayUseClocks.length})"><ol class="use-times-list"></ol></div>`
+  const prevUseClocks = prevView.ats.map(formatLastUsedClock).filter(Boolean);
+  const showUseCompare = dayUseClocks.length > 0 || prevUseClocks.length > 0;
+  const selLabel = useCompareDayLabel(selectedDate);
+  const prevLabel = useCompareDayLabel(prevDate);
+  const useTimesHtml = showUseCompare
+    ? `<div class="habit-use-times" aria-label="Use times: ${selLabel} vs ${prevLabel}">
+         <div class="use-times-day" data-role="selected">
+           <div class="use-times-day-label"></div>
+           <div class="use-times-scroll">
+             <ol class="use-times-list"></ol>
+             <span class="use-times-empty hidden">No uses</span>
+           </div>
+         </div>
+         <div class="use-times-day" data-role="prev">
+           <div class="use-times-day-label"></div>
+           <div class="use-times-scroll">
+             <ol class="use-times-list"></ol>
+             <span class="use-times-empty hidden">No uses</span>
+           </div>
+         </div>
+       </div>`
     : "";
 
   const alertHtml = [
@@ -1683,7 +1735,20 @@ function renderBadHabitCard(h) {
   card.querySelector(".habit-pill.schedule").textContent = scheduleLabel(h);
   card.querySelectorAll(".habit-warn").forEach((el, i) => { el.textContent = warnings[i]; });
   card.querySelectorAll(".habit-tip").forEach((el, i) => { el.textContent = tips[i]; });
-  fillUseTimeline(card.querySelector(".use-times-list"), dayUseClocks);
+  if (showUseCompare) {
+    const selRow = card.querySelector('.use-times-day[data-role="selected"]');
+    const prevRow = card.querySelector('.use-times-day[data-role="prev"]');
+    if (selRow) {
+      const lab = selRow.querySelector(".use-times-day-label");
+      if (lab) lab.textContent = selLabel;
+      fillUseCompareRow(selRow, dayUseClocks);
+    }
+    if (prevRow) {
+      const lab = prevRow.querySelector(".use-times-day-label");
+      if (lab) lab.textContent = prevLabel;
+      fillUseCompareRow(prevRow, prevUseClocks);
+    }
+  }
   if (overLimit) {
     const val = card.querySelector(".counter-value");
     val.classList.add("over");
