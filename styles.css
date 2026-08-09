@@ -669,7 +669,7 @@ body.habit-drag-active * { cursor: grabbing !important; }
 }
 .use-tl-node {
   flex: 1 1 0;
-  min-width: 46px;
+  min-width: 52px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -713,13 +713,14 @@ body.habit-drag-active * { cursor: grabbing !important; }
   animation: useTlPulse 0.7s ease 0.35s both;
 }
 .use-tl-time {
-  font-size: 0.58rem;
+  font-size: 0.62rem;
   font-weight: 600;
   color: var(--muted);
   letter-spacing: 0.01em;
   line-height: 1.15;
   text-align: center;
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 .use-tl-node.latest .use-tl-time {
   color: var(--accent-2);
