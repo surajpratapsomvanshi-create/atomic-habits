@@ -1,4 +1,4 @@
-const CACHE = "atomic-habits-v25";
+const CACHE = "atomic-habits-v26";
 const ASSETS = [
   "./",
   "./index.html",
@@ -21,10 +21,42 @@ self.addEventListener("activate", e => {
   );
 });
 
+function isShellRequest(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname.replace(/\/+$/, "") || "/";
+    return (
+      /\/(app\.js|styles\.css|index\.html|sw\.js|manifest\.webmanifest)$/.test(path) ||
+      path.endsWith("/atomic-habits") ||
+      path.endsWith("/atomic-habits/") ||
+      u.pathname.endsWith("/")
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
 self.addEventListener("fetch", e => {
   // never cache sync calls to Apps Script
   if (e.request.url.includes("script.google.com")) return;
   if (e.request.method !== "GET") return;
+
+  // Network-first for app shell so v26+ logic reaches phones stuck on old caches.
+  if (isShellRequest(e.request.url) || e.request.mode === "navigate") {
+    e.respondWith(
+      fetch(e.request)
+        .then(res => {
+          const copy = res.clone();
+          caches.open(CACHE).then(c => c.put(e.request, copy));
+          return res;
+        })
+        .catch(() =>
+          caches.match(e.request).then(hit => hit || caches.match("./index.html"))
+        )
+    );
+    return;
+  }
+
   e.respondWith(
     caches.match(e.request).then(hit => hit || fetch(e.request).then(res => {
       const copy = res.clone();

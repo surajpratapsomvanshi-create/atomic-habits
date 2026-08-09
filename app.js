@@ -25,6 +25,9 @@
 const LS_DATA = "ah.data";
 const LS_SETTINGS = "ah.settings";
 
+/** Visible app build — bump with every Pages deploy / SW cache bust. */
+const APP_VERSION = "26";
+
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbxxcZhrVNYDpg4ZUfFQNDGudJKUJENaQRRcoyMio8_YEdo5GoKscHAGyUhEd0iK9NkG/exec";
@@ -45,6 +48,8 @@ const DRAG_HANDLE =
   `<button class="habit-drag" type="button" aria-label="Drag to reorder" title="Drag to reorder"><span aria-hidden="true">⋮⋮</span></button>`;
 
 let data = migrateData(load(LS_DATA, { habits: [], checks: {}, counts: {} }));
+// Persist migrate heals (orphan lastUsedAt → punch, snapped counts) immediately.
+saveData();
 let settings = loadSettings();
 let selectedDate = todayStr();
 /** Rightmost day shown in the 7-day strip (selected date can be any day). */
@@ -185,11 +190,13 @@ function migrateData(raw) {
 
   const checks = raw.checks && typeof raw.checks === "object" ? raw.checks : {};
   const punches = migratePunches(raw.punches);
+  const lastUsedAt = migrateLastUsedAt(raw.lastUsedAt);
+  // Real clock from lastUsedAt that never became a punch (legacy +/sync) → punch row.
+  promoteOrphanLastUsedIntoPunches(punches, lastUsedAt);
   const counts = reconcileCountsFromPunches(
     raw.counts && typeof raw.counts === "object" ? raw.counts : {},
     punches
   );
-  const lastUsedAt = migrateLastUsedAt(raw.lastUsedAt);
   reconcileLastUsedAtFromPunches(lastUsedAt, punches);
   let activeListId = raw.activeListId != null ? String(raw.activeListId) : fallbackListId;
   if (!listIds.has(activeListId)) activeListId = fallbackListId;
@@ -267,9 +274,10 @@ function reconcileLastUsedAtFromPunches(lastUsedAt, punches) {
 }
 
 /**
- * For every habit/day that appears in the punch log, set counts[day][habitId]
- * to the unmatched-+ length (day-scoped). Legacy count keys with no punches
- * are left unchanged.
+ * For every habit/day that appears in the punch log OR still has a legacy
+ * counts[day][habitId], set the count to the unmatched-+ length (day-scoped).
+ * Inflated legacy counts (e.g. 4 with only 2 punches) snap down to punch truth.
+ * Days with a stored count but zero punches stay unchanged (pre-timeline era).
  */
 function reconcileCountsFromPunches(countsIn, punches) {
   const counts = countsIn && typeof countsIn === "object" ? { ...countsIn } : {};
@@ -290,6 +298,15 @@ function reconcileCountsFromPunches(countsIn, punches) {
     if (!pairs.has(id)) pairs.set(id, new Set());
     pairs.get(id).add(day);
   }
+  // Also touch legacy count keys for habits that have any punches (snap inflated).
+  for (const day of Object.keys(counts)) {
+    const row = counts[day];
+    if (!row || typeof row !== "object") continue;
+    for (const id of Object.keys(row)) {
+      if (!pairs.has(id)) continue;
+      pairs.get(id).add(day);
+    }
+  }
 
   for (const [id, days] of pairs) {
     const stack = unmatchedPlusStack(punches, id);
@@ -300,6 +317,10 @@ function reconcileCountsFromPunches(countsIn, punches) {
     }
     for (const day of days) {
       const n = byDay.get(day) || 0;
+      const hadPunchForDay = punches.some(
+        p => p && String(p.habitId) === id && punchDay(p) === day
+      );
+      if (!hadPunchForDay) continue; // pure legacy count, no punch rows for day
       if (!counts[day]) counts[day] = {};
       if (n === 0) {
         delete counts[day][id];
@@ -310,6 +331,45 @@ function reconcileCountsFromPunches(countsIn, punches) {
     }
   }
   return counts;
+}
+
+/**
+ * If lastUsedAt has a real clock that is not represented by an unmatched +
+ * punch on that local calendar day, append a synthetic + punch (same ISO).
+ * Does not invent unknown times for inflated counts — only preserves a known clock.
+ * Mutates `punches` in place; returns it.
+ */
+function promoteOrphanLastUsedIntoPunches(punches, lastUsedAt) {
+  if (!Array.isArray(punches)) return punches;
+  if (!lastUsedAt || typeof lastUsedAt !== "object") return punches;
+  for (const [habitId, iso] of Object.entries(lastUsedAt)) {
+    const id = String(habitId || "");
+    if (!id) continue;
+    const s = String(iso || "").trim();
+    const t = Date.parse(s);
+    if (!Number.isFinite(t)) continue;
+    const at = new Date(t).toISOString();
+    const day = dateStr(new Date(t));
+    const dayStack = unmatchedPlusStack(punches, id).filter(x => x.day === day);
+    const already = dayStack.some(x => {
+      const tx = Date.parse(x.at);
+      return Number.isFinite(tx) && Math.abs(tx - t) < 60000;
+    });
+    if (already) continue;
+    const lastPunchMs = dayStack.length
+      ? Date.parse(dayStack[dayStack.length - 1].at)
+      : NaN;
+    // Stale lastUsedAt older than the latest punch on that day → ignore (map will sync).
+    if (Number.isFinite(lastPunchMs) && t <= lastPunchMs) continue;
+    punches.push({
+      id: "p-orphan-" + id + "-" + t.toString(36),
+      habitId: id,
+      at,
+      delta: 1,
+      day,
+    });
+  }
+  return punches;
 }
 
 /**
@@ -811,25 +871,67 @@ function getUnmatchedPlusPunches(habitId, day, punches) {
 
 /** ISO clock times of unmatched + punches for habitId on calendar day. */
 function useTimesForDay(habitId, day) {
-  return getUnmatchedPlusPunches(habitId, day).map(x => x.at);
+  return badDayView(habitId, day).ats;
 }
 
 /**
- * Effective bad-habit count for a day. When any punch is attributed to that day,
- * unmatched + punches are the source of truth (keeps counter ≡ timeline length).
- * Legacy days with a stored count but no punches keep the counts map value.
+ * Single source of truth for a bad habit on a calendar day.
+ * `count` is ALWAYS `ats.length` when any use event exists for that day
+ * (punches, or legacy lastUsedAt falling on the day). Inflated counts[day]
+ * never outrun the timeline. Pure legacy (stored count, no punches, no
+ * lastUsedAt on day) keeps stored count with an empty timeline until the
+ * user taps + (recordPunch backfills).
+ */
+function badDayView(habitId, day, punchesIn, lastUsedIn, countsIn) {
+  const dayKey = day && /^\d{4}-\d{2}-\d{2}$/.test(String(day)) ? String(day) : "";
+  const id = String(habitId || "");
+  const punches = Array.isArray(punchesIn)
+    ? punchesIn
+    : (Array.isArray(typeof data !== "undefined" ? data.punches : null) ? data.punches : []);
+  const lastMap = lastUsedIn && typeof lastUsedIn === "object"
+    ? lastUsedIn
+    : (typeof data !== "undefined" && data.lastUsedAt && typeof data.lastUsedAt === "object"
+      ? data.lastUsedAt
+      : {});
+  const counts = countsIn && typeof countsIn === "object"
+    ? countsIn
+    : (typeof data !== "undefined" && data.counts && typeof data.counts === "object"
+      ? data.counts
+      : {});
+  const stored = (() => {
+    if (!dayKey || !id) return 0;
+    const row = counts[dayKey];
+    if (!row || row[id] == null) return 0;
+    return Number(row[id]) || 0;
+  })();
+
+  if (!dayKey || !id) {
+    return { ats: [], count: stored, lastIso: null };
+  }
+
+  let ats = getUnmatchedPlusPunches(id, dayKey, punches).map(x => x.at);
+
+  // Legacy: no punches for this day, but lastUsedAt lands on this local day.
+  if (!ats.length) {
+    const lu = lastMap[id] ? String(lastMap[id]) : null;
+    const t = lu ? Date.parse(lu) : NaN;
+    if (Number.isFinite(t) && dateStr(new Date(t)) === dayKey) {
+      ats = [new Date(t).toISOString()];
+    }
+  }
+
+  if (ats.length) {
+    return { ats, count: ats.length, lastIso: ats[ats.length - 1] };
+  }
+  return { ats: [], count: stored, lastIso: null };
+}
+
+/**
+ * Effective bad-habit count for a day — always matches timeline length when
+ * any use events exist (see badDayView).
  */
 function badCountForDay(habitId, day) {
-  const dayKey = day && /^\d{4}-\d{2}-\d{2}$/.test(String(day)) ? String(day) : "";
-  const stored = getCount(habitId, day);
-  if (!dayKey) return stored;
-  const id = String(habitId || "");
-  const punches = Array.isArray(data.punches) ? data.punches : [];
-  const hasDayPunch = punches.some(
-    p => p && String(p.habitId) === id && punchDay(p) === dayKey
-  );
-  if (!hasDayPunch) return stored;
-  return getUnmatchedPlusPunches(id, dayKey, punches).length;
+  return badDayView(habitId, day).count;
 }
 
 function lastUsedAtFromPunches(habitId) {
@@ -1360,8 +1462,10 @@ function renderGoodHabitCard(h) {
 }
 
 function renderBadHabitCard(h) {
-  const dayUseAts = useTimesForDay(h.id, selectedDate);
-  const count = badCountForDay(h.id, selectedDate);
+  // One array drives count, timeline, and last-used clock — they cannot diverge.
+  const dayView = badDayView(h.id, selectedDate);
+  const dayUseAts = dayView.ats;
+  const count = dayView.count;
   const { avg, samples } = historicalAverage(h.id, selectedDate);
   const overLimit = h.dailyLimit != null && count > h.dailyLimit;
   const overAvg = avg != null && samples >= MIN_AVG_HISTORY_DAYS && count > avg;
@@ -1385,8 +1489,7 @@ function renderBadHabitCard(h) {
   const avgPill = hasAvg
     ? `<span class="habit-pill avg">Avg ${avg.toFixed(1)}</span>`
     : `<span class="habit-pill avg pending">Avg pending</span>`;
-  // Prefer latest punch on the selected day for the clock; else global lastUsedAt.
-  const lastIso = (dayUseAts.length ? dayUseAts[dayUseAts.length - 1] : null) || getLastUsedAt(h.id);
+  const lastIso = dayView.lastIso || (dayUseAts.length ? null : getLastUsedAt(h.id));
   const lastLabel = formatLastUsedAgo(lastIso);
   const lastClock = formatLastUsedClock(lastIso);
   const lastUsedHtml = lastLabel
@@ -2253,18 +2356,20 @@ function mergeHabitData(localData, cloudData) {
   ]);
   for (const id of usedIds) {
     const fromStack = lastUsedAtFromPunchesList(punches, id);
+    const fromMaps = laterIso(
+      (cld.lastUsedAt && cld.lastUsedAt[id]) || null,
+      (loc.lastUsedAt && loc.lastUsedAt[id]) || null
+    );
     if (fromStack) {
-      lastUsedAt[id] = fromStack;
+      // Keep a newer map clock (orphan lastUsedAt) so migrate can promote it
+      // into a punch — otherwise 09:29-style stamps vanish while counts stay high.
+      lastUsedAt[id] = laterIso(fromStack, fromMaps) || fromStack;
       continue;
     }
     // Stack empty with punches for this habit → undos canceled all +; clear.
     const hadPunches = punches.some(p => p && String(p.habitId) === id);
     if (hadPunches) continue;
-    const later = laterIso(
-      (cld.lastUsedAt && cld.lastUsedAt[id]) || null,
-      (loc.lastUsedAt && loc.lastUsedAt[id]) || null
-    );
-    if (later) lastUsedAt[id] = later;
+    if (fromMaps) lastUsedAt[id] = fromMaps;
   }
 
   let activeListId = loc.activeListId || cld.activeListId || fallbackListId;
@@ -3110,10 +3215,13 @@ try {
     getUnmatchedPlusPunches,
     useTimesForDay,
     badCountForDay,
+    badDayView,
+    promoteOrphanLastUsedIntoPunches,
     formatLastUsedClock,
     reconcileCountsFromPunches,
     applyCountDelta,
     migrateData,
+    APP_VERSION,
     createList,
     renameList,
     deleteList,
@@ -3128,5 +3236,13 @@ try {
 
 // register the service worker for offline use / installability
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("sw.js").catch(() => {});
+  navigator.serviceWorker
+    .register("sw.js", { updateViaCache: "none" })
+    .then(reg => { try { reg.update(); } catch (_) { /* ignore */ } })
+    .catch(() => {});
 }
+
+try {
+  const verEl = document.getElementById("app-version-label");
+  if (verEl) verEl.textContent = "App version " + APP_VERSION;
+} catch (_) { /* ignore */ }
