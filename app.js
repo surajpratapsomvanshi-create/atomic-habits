@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "32";
+const APP_VERSION = "33";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -1246,24 +1246,50 @@ function fillUseTimeline(listEl, clocks) {
   listEl.appendChild(frag);
 }
 
-/** Fill a compare row: chips when present, clear empty state otherwise. */
+/**
+ * Fill a compare row: label on its own line, full-width times underneath.
+ * Writes plain HH:MM text + chip spans so times stay visible even if chip CSS fails.
+ */
 function fillUseCompareRow(rowEl, clocks) {
   if (!rowEl) return;
   const scroll = rowEl.querySelector(".use-times-scroll");
   const list = rowEl.querySelector(".use-times-list");
+  const plain = rowEl.querySelector(".use-times-plain");
   const empty = rowEl.querySelector(".use-times-empty");
-  if (!scroll || !list || !empty) return;
+  if (!scroll || !empty) return;
   const has = Array.isArray(clocks) && clocks.length > 0;
-  list.classList.toggle("hidden", !has);
+  if (list) list.classList.add("hidden");
+  if (plain) plain.classList.toggle("hidden", !has);
   empty.classList.toggle("hidden", has);
+  rowEl.setAttribute("data-times", has ? clocks.join(" ") : "");
   if (has) {
-    fillUseTimeline(list, clocks);
-    // Keep latest chip in view — early times alone looked like an empty rail.
-    requestAnimationFrame(() => {
-      scroll.scrollLeft = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
-    });
+    // Primary: chip spans inside plain container (full-width rail under label).
+    if (plain) {
+      plain.replaceChildren();
+      const frag = document.createDocumentFragment();
+      const last = clocks.length - 1;
+      clocks.forEach((clock, i) => {
+        const time = document.createElement("time");
+        time.className = "use-time-clock" + (i === last ? " latest" : "");
+        time.setAttribute("datetime", clock);
+        time.setAttribute("title", i === last ? "Latest · " + clock : clock);
+        time.textContent = clock;
+        frag.appendChild(time);
+        if (i < last) frag.appendChild(document.createTextNode(" "));
+      });
+      // Also mirror as a single text node attribute for View Source checks.
+      plain.setAttribute("data-times-text", clocks.join("  "));
+      plain.appendChild(frag);
+    }
+    if (list) fillUseTimeline(list, clocks);
+    // Start at the left so the first clocks are always on-screen.
+    requestAnimationFrame(() => { scroll.scrollLeft = 0; });
   } else {
-    list.replaceChildren();
+    if (list) list.replaceChildren();
+    if (plain) {
+      plain.replaceChildren();
+      plain.removeAttribute("data-times-text");
+    }
     empty.textContent = "No uses";
   }
 }
@@ -1715,16 +1741,18 @@ function renderBadHabitCard(h) {
   const prevLabel = useCompareDayLabel(prevDate);
   const useTimesHtml = showUseCompare
     ? `<div class="habit-use-times" aria-label="Use times: ${selLabel} vs ${prevLabel}">
-         <div class="use-times-day" data-role="selected">
+         <div class="use-times-day" data-role="selected" data-times="">
            <div class="use-times-day-label"></div>
            <div class="use-times-scroll">
+             <div class="use-times-plain" aria-hidden="true"></div>
              <ol class="use-times-list"></ol>
              <span class="use-times-empty hidden">No uses</span>
            </div>
          </div>
-         <div class="use-times-day" data-role="prev">
+         <div class="use-times-day" data-role="prev" data-times="">
            <div class="use-times-day-label"></div>
            <div class="use-times-scroll">
+             <div class="use-times-plain" aria-hidden="true"></div>
              <ol class="use-times-list"></ol>
              <span class="use-times-empty hidden">No uses</span>
            </div>

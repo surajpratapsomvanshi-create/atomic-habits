@@ -644,29 +644,34 @@ body.habit-drag-active * { cursor: grabbing !important; }
   color: var(--muted);
   font-weight: 600;
 }
-/* Bad-habit use times: Today vs previous day — two horizontal chip rails */
+/* Bad-habit use times: Today vs previous day — label above, full-width time rail */
 .habit-use-times {
   margin-top: 8px;
   max-width: 100%;
+  min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
   padding: 8px 9px;
   border-radius: 10px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
   background:
     linear-gradient(180deg, rgba(138, 180, 248, 0.1), rgba(255, 255, 255, 0.03)),
     var(--surface-2);
   border: 1px solid rgba(138, 180, 248, 0.22);
+  overflow: visible;
 }
 .use-times-day {
-  display: grid;
-  grid-template-columns: minmax(4.8rem, auto) minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
   min-width: 0;
+  width: 100%;
 }
 .use-times-day-label {
-  font-size: 0.7rem;
+  font-size: 0.72rem;
   font-weight: 750;
   letter-spacing: 0.01em;
   color: var(--text);
@@ -688,37 +693,54 @@ body.habit-drag-active * { cursor: grabbing !important; }
 }
 .use-times-scroll {
   position: relative;
+  display: block;
+  width: 100%;
   min-width: 0;
+  max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
   overscroll-behavior-x: contain;
   scrollbar-width: thin;
-  scrollbar-color: rgba(138, 180, 248, 0.55) rgba(255, 255, 255, 0.06);
-  /* White = visible for WebKit luminance masks; do not use #000 here. */
-  -webkit-mask-image: linear-gradient(90deg, #fff 0%, #fff calc(100% - 18px), transparent);
-  mask-image: linear-gradient(90deg, #fff 0%, #fff calc(100% - 18px), transparent);
-  -webkit-mask-size: 100% 100%;
-  mask-size: 100% 100%;
-  -webkit-mask-repeat: no-repeat;
-  mask-repeat: no-repeat;
+  scrollbar-color: rgba(138, 180, 248, 0.7) rgba(255, 255, 255, 0.08);
+  /* No fade mask — masks were clipping chips to invisibility on narrow rails. */
+  -webkit-mask-image: none;
+  mask-image: none;
 }
 .use-times-scroll::-webkit-scrollbar {
-  height: 4px;
+  height: 5px;
 }
 .use-times-scroll::-webkit-scrollbar-thumb {
-  background: rgba(138, 180, 248, 0.55);
+  background: rgba(138, 180, 248, 0.65);
   border-radius: 999px;
 }
-.use-times-list {
-  list-style: none;
-  margin: 0;
-  padding: 2px 18px 4px 0;
+/* Primary visible times: high-contrast chip row under the day label */
+.use-times-plain {
   display: flex;
   flex-wrap: nowrap;
   align-items: center;
   gap: 6px;
   width: max-content;
+  min-width: min-content;
+  margin: 0;
+  padding: 2px 2px 6px 0;
+  color: #f8fafc;
+  font-size: 0.8rem;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.use-times-plain.hidden {
+  display: none !important;
+}
+/* Legacy list kept in DOM for a11y fallback; hidden — plain rail is primary */
+.use-times-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: none !important;
 }
 .use-times-empty {
   display: inline-block;
@@ -730,6 +752,9 @@ body.habit-drag-active * { cursor: grabbing !important; }
   border-radius: 999px;
   padding: 4px 10px;
   white-space: nowrap;
+}
+.use-times-empty.hidden {
+  display: none !important;
 }
 .use-time-row {
   display: inline-flex;
@@ -743,37 +768,40 @@ body.habit-drag-active * { cursor: grabbing !important; }
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 3.1em;
-  padding: 5px 9px;
+  flex: 0 0 auto;
+  min-width: 3.25em;
+  padding: 5px 10px;
   border-radius: 999px;
-  font-size: 0.78rem;
+  font-size: 0.8rem;
   font-weight: 750;
   letter-spacing: 0.02em;
   line-height: 1.2;
   font-variant-numeric: tabular-nums;
-  color: #f1f3f4;
-  background: rgba(138, 180, 248, 0.18);
-  border: 1px solid rgba(138, 180, 248, 0.42);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  color: #ffffff !important;
+  background: #3c4043 !important;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
 }
+.use-time-clock.latest,
 .use-time-row.latest .use-time-clock {
-  color: #102040;
+  color: #102040 !important;
   font-weight: 800;
-  background: var(--accent-grad);
+  background: var(--accent-grad) !important;
   border-color: transparent;
   box-shadow: 0 1px 8px rgba(102, 157, 246, 0.4);
   animation: useChipIn 0.38s ease-out;
 }
 .use-times-day[data-role="prev"] .use-time-clock {
-  color: #e8eaed;
-  background: rgba(255, 255, 255, 0.1);
+  color: #f1f3f4 !important;
+  background: #2d3136 !important;
   border-color: rgba(255, 255, 255, 0.22);
 }
+.use-times-day[data-role="prev"] .use-time-clock.latest,
 .use-times-day[data-role="prev"] .use-time-row.latest .use-time-clock {
-  color: #e8eaed;
+  color: #e8eaed !important;
   font-weight: 800;
-  background: rgba(138, 180, 248, 0.28);
-  border-color: rgba(138, 180, 248, 0.5);
+  background: #3d4a5c !important;
+  border-color: rgba(138, 180, 248, 0.55);
   box-shadow: none;
   animation: none;
 }
@@ -782,6 +810,7 @@ body.habit-drag-active * { cursor: grabbing !important; }
   to { transform: scale(1); opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
+  .use-time-clock.latest,
   .use-time-row.latest .use-time-clock { animation: none; }
 }
 
