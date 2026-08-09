@@ -26,7 +26,7 @@ const LS_DATA = "ah.data";
 const LS_SETTINGS = "ah.settings";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "27";
+const APP_VERSION = "28";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -50,6 +50,49 @@ const DRAG_HANDLE =
 let data = migrateData(load(LS_DATA, { habits: [], checks: {}, counts: {} }));
 // Persist migrate heals (orphan lastUsedAt → punch, count→timeline backfill) immediately.
 saveData();
+
+/**
+ * Re-run punch/count/lastUsed heals when mid-session drift appears
+ * (cloud merge, legacy data, or stale clients). Returns true if data changed.
+ */
+function healDataDrift() {
+  if (!data || typeof data !== "object") return false;
+  if (!Array.isArray(data.punches)) data.punches = [];
+  if (!data.lastUsedAt || typeof data.lastUsedAt !== "object") data.lastUsedAt = {};
+  if (!data.counts || typeof data.counts !== "object") data.counts = {};
+  const before = JSON.stringify({
+    p: data.punches,
+    c: data.counts,
+    l: data.lastUsedAt,
+  });
+  promoteOrphanLastUsedIntoPunches(data.punches, data.lastUsedAt);
+  backfillCountGapsIntoPunches(data.punches, data.counts, data.lastUsedAt);
+  data.counts = reconcileCountsFromPunches(data.counts, data.punches);
+  reconcileLastUsedAtFromPunches(data.lastUsedAt, data.punches);
+  const after = JSON.stringify({
+    p: data.punches,
+    c: data.counts,
+    l: data.lastUsedAt,
+  });
+  return before !== after;
+}
+
+/** True when stored day count, punch times, or lastUsedAt disagree for habit/day. */
+function dayViewDrift(habitId, day) {
+  const dayKey = day && /^\d{4}-\d{2}-\d{2}$/.test(String(day)) ? String(day) : "";
+  const id = String(habitId || "");
+  if (!dayKey || !id) return false;
+  const stored = getCount(id, dayKey);
+  const ats = getUnmatchedPlusPunches(id, dayKey, data.punches);
+  if (stored !== ats.length && (stored > 0 || ats.length > 0)) return true;
+  const lu = getLastUsedAt(id);
+  if (!lu) return false;
+  const t = Date.parse(lu);
+  if (!Number.isFinite(t) || dateStr(new Date(t)) !== dayKey) return false;
+  if (!ats.length) return true;
+  const lastMs = Date.parse(ats[ats.length - 1].at);
+  return !Number.isFinite(lastMs) || Math.abs(lastMs - t) >= 60000;
+}
 let settings = loadSettings();
 let selectedDate = todayStr();
 /** Rightmost day shown in the 7-day strip (selected date can be any day). */
@@ -976,9 +1019,10 @@ function useTimesForDay(habitId, day) {
 
 /**
  * Single source of truth for a bad habit on a calendar day.
- * After migrate heal, punch length matches the stored day total so
- * `count === ats.length` and lastUsed is the last timeline node. Pure display
- * fallback still promotes orphan lastUsedAt when punches are empty.
+ * After heal, punch length matches the stored day total so
+ * `count === ats.length` and lastUsed is the last timeline node.
+ * Display also appends orphan lastUsedAt when it is newer than punches
+ * (even if some punches already exist for the day).
  */
 function badDayView(habitId, day, punchesIn, lastUsedIn, countsIn) {
   const dayKey = day && /^\d{4}-\d{2}-\d{2}$/.test(String(day)) ? String(day) : "";
@@ -1009,12 +1053,20 @@ function badDayView(habitId, day, punchesIn, lastUsedIn, countsIn) {
 
   let ats = getUnmatchedPlusPunches(id, dayKey, punches).map(x => x.at);
 
-  // Legacy: no punches for this day, but lastUsedAt lands on this local day.
-  if (!ats.length) {
-    const lu = lastMap[id] ? String(lastMap[id]) : null;
-    const t = lu ? Date.parse(lu) : NaN;
-    if (Number.isFinite(t) && dateStr(new Date(t)) === dayKey) {
-      ats = [new Date(t).toISOString()];
+  // Orphan / newer lastUsedAt on this day must appear as the last use time.
+  const lu = lastMap[id] ? String(lastMap[id]) : null;
+  const t = lu ? Date.parse(lu) : NaN;
+  if (Number.isFinite(t) && dateStr(new Date(t)) === dayKey) {
+    const luIso = new Date(t).toISOString();
+    const already = ats.some(a => {
+      const tx = Date.parse(a);
+      return Number.isFinite(tx) && Math.abs(tx - t) < 60000;
+    });
+    if (!already) {
+      const lastMs = ats.length ? Date.parse(ats[ats.length - 1]) : NaN;
+      if (!ats.length || !Number.isFinite(lastMs) || t > lastMs) {
+        ats = ats.concat([luIso]);
+      }
     }
   }
 
@@ -1160,22 +1212,18 @@ function formatLastUsedClock(iso) {
   return hh + ":" + mm;
 }
 
-/** Build the bad-habit day-spine use timeline nodes (text-safe). */
+/** Build the bad-habit use-times list (one visible row per use; text-safe). */
 function fillUseTimeline(listEl, clocks) {
   if (!listEl || !clocks || !clocks.length) return;
   const frag = document.createDocumentFragment();
   const last = clocks.length - 1;
   clocks.forEach((clock, i) => {
     const li = document.createElement("li");
-    li.className = "use-tl-node" + (i === last ? " latest" : "");
-    li.style.setProperty("--i", String(i));
-    const dot = document.createElement("span");
-    dot.className = "use-tl-dot";
-    dot.setAttribute("aria-hidden", "true");
+    li.className = "use-time-row" + (i === last ? " latest" : "");
     const time = document.createElement("time");
-    time.className = "use-tl-time";
+    time.className = "use-time-clock";
     time.textContent = clock;
-    li.append(dot, time);
+    li.appendChild(time);
     frag.appendChild(li);
   });
   listEl.appendChild(frag);
@@ -1357,6 +1405,8 @@ function completionRate(habitId) {
 
 /* ---------------- rendering ---------------- */
 function render() {
+  // Heal count↔timeline↔lastUsed drift before paint (selected day + all days).
+  if (healDataDrift()) saveData();
   renderListTabs();
   renderDateStrip();
   renderHabits();
@@ -1560,6 +1610,9 @@ function renderGoodHabitCard(h) {
 }
 
 function renderBadHabitCard(h) {
+  // Heal this habit/day if count, punch times, or lastUsedAt disagree.
+  if (dayViewDrift(h.id, selectedDate) && healDataDrift()) saveData();
+
   // One array drives count, timeline, and last-used clock — they cannot diverge.
   const dayView = badDayView(h.id, selectedDate);
   const dayUseAts = dayView.ats;
@@ -1595,7 +1648,7 @@ function renderBadHabitCard(h) {
     : `<div class="habit-last-used never">Not used yet</div>`;
   const dayUseClocks = dayUseAts.map(formatLastUsedClock).filter(Boolean);
   const useTimesHtml = dayUseClocks.length
-    ? `<div class="habit-use-timeline" aria-label="Use times"><ol class="use-tl-list"></ol></div>`
+    ? `<div class="habit-use-times" aria-label="Use times"><ol class="use-times-list"></ol></div>`
     : "";
 
   const alertHtml = [
@@ -1627,7 +1680,7 @@ function renderBadHabitCard(h) {
   card.querySelector(".habit-pill.schedule").textContent = scheduleLabel(h);
   card.querySelectorAll(".habit-warn").forEach((el, i) => { el.textContent = warnings[i]; });
   card.querySelectorAll(".habit-tip").forEach((el, i) => { el.textContent = tips[i]; });
-  fillUseTimeline(card.querySelector(".use-tl-list"), dayUseClocks);
+  fillUseTimeline(card.querySelector(".use-times-list"), dayUseClocks);
   if (overLimit) {
     const val = card.querySelector(".counter-value");
     val.classList.add("over");
@@ -3316,6 +3369,8 @@ try {
     badDayView,
     promoteOrphanLastUsedIntoPunches,
     backfillCountGapsIntoPunches,
+    healDataDrift,
+    dayViewDrift,
     formatLastUsedClock,
     reconcileCountsFromPunches,
     applyCountDelta,
