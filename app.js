@@ -1744,7 +1744,7 @@ function renderBadHabitCard(h) {
          <div class="use-times-day" data-role="selected" data-times="">
            <div class="use-times-day-label"></div>
            <div class="use-times-scroll">
-             <div class="use-times-plain" aria-hidden="true"></div>
+             <div class="use-times-plain"></div>
              <ol class="use-times-list"></ol>
              <span class="use-times-empty hidden">No uses</span>
            </div>
@@ -1752,7 +1752,7 @@ function renderBadHabitCard(h) {
          <div class="use-times-day" data-role="prev" data-times="">
            <div class="use-times-day-label"></div>
            <div class="use-times-scroll">
-             <div class="use-times-plain" aria-hidden="true"></div>
+             <div class="use-times-plain"></div>
              <ol class="use-times-list"></ol>
              <span class="use-times-empty hidden">No uses</span>
            </div>
