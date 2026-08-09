@@ -26,7 +26,7 @@ const LS_DATA = "ah.data";
 const LS_SETTINGS = "ah.settings";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "26";
+const APP_VERSION = "27";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -48,7 +48,7 @@ const DRAG_HANDLE =
   `<button class="habit-drag" type="button" aria-label="Drag to reorder" title="Drag to reorder"><span aria-hidden="true">⋮⋮</span></button>`;
 
 let data = migrateData(load(LS_DATA, { habits: [], checks: {}, counts: {} }));
-// Persist migrate heals (orphan lastUsedAt → punch, snapped counts) immediately.
+// Persist migrate heals (orphan lastUsedAt → punch, count→timeline backfill) immediately.
 saveData();
 let settings = loadSettings();
 let selectedDate = todayStr();
@@ -191,12 +191,12 @@ function migrateData(raw) {
   const checks = raw.checks && typeof raw.checks === "object" ? raw.checks : {};
   const punches = migratePunches(raw.punches);
   const lastUsedAt = migrateLastUsedAt(raw.lastUsedAt);
+  const countsIn = raw.counts && typeof raw.counts === "object" ? raw.counts : {};
   // Real clock from lastUsedAt that never became a punch (legacy +/sync) → punch row.
   promoteOrphanLastUsedIntoPunches(punches, lastUsedAt);
-  const counts = reconcileCountsFromPunches(
-    raw.counts && typeof raw.counts === "object" ? raw.counts : {},
-    punches
-  );
+  // Keep the stored day totals: invent missing punch nodes so timeline length ≡ count.
+  backfillCountGapsIntoPunches(punches, countsIn, lastUsedAt);
+  const counts = reconcileCountsFromPunches(countsIn, punches);
   reconcileLastUsedAtFromPunches(lastUsedAt, punches);
   let activeListId = raw.activeListId != null ? String(raw.activeListId) : fallbackListId;
   if (!listIds.has(activeListId)) activeListId = fallbackListId;
@@ -276,8 +276,9 @@ function reconcileLastUsedAtFromPunches(lastUsedAt, punches) {
 /**
  * For every habit/day that appears in the punch log OR still has a legacy
  * counts[day][habitId], set the count to the unmatched-+ length (day-scoped).
- * Inflated legacy counts (e.g. 4 with only 2 punches) snap down to punch truth.
- * Days with a stored count but zero punches stay unchanged (pre-timeline era).
+ * After backfillCountGapsIntoPunches, punch length should already match (or
+ * exceed) the stored total — reconcile keeps count ≡ timeline. Days with a
+ * stored count but zero punches stay unchanged until backfill runs.
  */
 function reconcileCountsFromPunches(countsIn, punches) {
   const counts = countsIn && typeof countsIn === "object" ? { ...countsIn } : {};
@@ -298,12 +299,12 @@ function reconcileCountsFromPunches(countsIn, punches) {
     if (!pairs.has(id)) pairs.set(id, new Set());
     pairs.get(id).add(day);
   }
-  // Also touch legacy count keys for habits that have any punches (snap inflated).
+  // Also touch legacy count keys for habits that have any punches.
   for (const day of Object.keys(counts)) {
     const row = counts[day];
     if (!row || typeof row !== "object") continue;
     for (const id of Object.keys(row)) {
-      if (!pairs.has(id)) continue;
+      if (!pairs.has(id)) pairs.set(id, new Set());
       pairs.get(id).add(day);
     }
   }
@@ -334,10 +335,109 @@ function reconcileCountsFromPunches(countsIn, punches) {
 }
 
 /**
+ * Heal legacy gaps: when counts[day][habitId] = N but fewer than N unmatched +
+ * punches exist for that day, insert synthetic + punches so the timeline shows
+ * every use. Known clocks (existing punches / lastUsedAt on that day) are kept;
+ * remaining unknowns are staggered one minute apart just before the earliest
+ * known punch (or before local noon if none).
+ *
+ * Gap punches are inserted *before* the first existing + for that habit/day in
+ * the log so stack order stays chronological and lastUsed stays the newest node.
+ * Mutates `punches` in place.
+ */
+function backfillCountGapsIntoPunches(punches, counts, lastUsedAt) {
+  if (!Array.isArray(punches)) return punches;
+  if (!counts || typeof counts !== "object") return punches;
+  const lastMap = lastUsedAt && typeof lastUsedAt === "object" ? lastUsedAt : {};
+  const STEP_MS = 60 * 1000;
+
+  for (const day of Object.keys(counts)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
+    const row = counts[day];
+    if (!row || typeof row !== "object") continue;
+    for (const habitId of Object.keys(row)) {
+      const id = String(habitId || "");
+      if (!id) continue;
+      const want = Math.max(0, Math.floor(Number(row[id]) || 0));
+      if (want <= 0) continue;
+
+      let dayStack = unmatchedPlusStack(punches, id).filter(x => x.day === day);
+      let gap = want - dayStack.length;
+      if (gap <= 0) continue;
+
+      // Newest missing slot: append lastUsedAt if it falls on this day and is new.
+      const lu = lastMap[id] ? String(lastMap[id]) : null;
+      const luMs = lu ? Date.parse(lu) : NaN;
+      if (Number.isFinite(luMs) && dateStr(new Date(luMs)) === day) {
+        const already = dayStack.some(x => {
+          const tx = Date.parse(x.at);
+          return Number.isFinite(tx) && Math.abs(tx - luMs) < 60000;
+        });
+        if (!already) {
+          punches.push({
+            id: "p-bf-lu-" + id + "-" + day + "-" + luMs.toString(36),
+            habitId: id,
+            at: new Date(luMs).toISOString(),
+            delta: 1,
+            day,
+          });
+          gap -= 1;
+          dayStack = unmatchedPlusStack(punches, id).filter(x => x.day === day);
+        }
+      }
+      if (gap <= 0) continue;
+
+      const knownMs = dayStack
+        .map(x => Date.parse(x.at))
+        .filter(Number.isFinite)
+        .sort((a, b) => a - b);
+      let anchorMs;
+      if (knownMs.length) {
+        anchorMs = knownMs[0];
+      } else {
+        const [y, m, d] = day.split("-").map(Number);
+        anchorMs = new Date(y, m - 1, d, 12, 0, 0).getTime();
+      }
+
+      // Insert older unknowns before the first + for this habit/day (keep last = newest).
+      let insertAt = -1;
+      for (let i = 0; i < punches.length; i++) {
+        const p = punches[i];
+        if (!p || String(p.habitId) !== id) continue;
+        if (Number(p.delta) <= 0) continue;
+        if (punchDay(p) !== day) continue;
+        insertAt = i;
+        break;
+      }
+      if (insertAt < 0) insertAt = punches.length;
+
+      const toInsert = [];
+      for (let i = 0; i < gap; i++) {
+        let ms = anchorMs - (gap - i) * STEP_MS;
+        if (dateStr(new Date(ms)) !== day) {
+          const [y, m, d] = day.split("-").map(Number);
+          ms = new Date(y, m - 1, d, 0, 1 + i, 0).getTime();
+        }
+        toInsert.push({
+          id: "p-bf-gap-" + id + "-" + day.replace(/-/g, "") + "-" + i + "-" +
+            Math.random().toString(36).slice(2, 6),
+          habitId: id,
+          at: new Date(ms).toISOString(),
+          delta: 1,
+          day,
+        });
+      }
+      punches.splice(insertAt, 0, ...toInsert);
+    }
+  }
+  return punches;
+}
+
+/**
  * If lastUsedAt has a real clock that is not represented by an unmatched +
  * punch on that local calendar day, append a synthetic + punch (same ISO).
- * Does not invent unknown times for inflated counts — only preserves a known clock.
- * Mutates `punches` in place; returns it.
+ * Mutates `punches` in place; returns it. Remaining count gaps are filled by
+ * backfillCountGapsIntoPunches.
  */
 function promoteOrphanLastUsedIntoPunches(punches, lastUsedAt) {
   if (!Array.isArray(punches)) return punches;
@@ -876,11 +976,9 @@ function useTimesForDay(habitId, day) {
 
 /**
  * Single source of truth for a bad habit on a calendar day.
- * `count` is ALWAYS `ats.length` when any use event exists for that day
- * (punches, or legacy lastUsedAt falling on the day). Inflated counts[day]
- * never outrun the timeline. Pure legacy (stored count, no punches, no
- * lastUsedAt on day) keeps stored count with an empty timeline until the
- * user taps + (recordPunch backfills).
+ * After migrate heal, punch length matches the stored day total so
+ * `count === ats.length` and lastUsed is the last timeline node. Pure display
+ * fallback still promotes orphan lastUsedAt when punches are empty.
  */
 function badDayView(habitId, day, punchesIn, lastUsedIn, countsIn) {
   const dayKey = day && /^\d{4}-\d{2}-\d{2}$/.test(String(day)) ? String(day) : "";
@@ -3217,6 +3315,7 @@ try {
     badCountForDay,
     badDayView,
     promoteOrphanLastUsedIntoPunches,
+    backfillCountGapsIntoPunches,
     formatLastUsedClock,
     reconcileCountsFromPunches,
     applyCountDelta,

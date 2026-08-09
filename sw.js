@@ -1,4 +1,4 @@
-const CACHE = "atomic-habits-v26";
+const CACHE = "atomic-habits-v27";
 const ASSETS = [
   "./",
   "./index.html",
@@ -41,7 +41,7 @@ self.addEventListener("fetch", e => {
   if (e.request.url.includes("script.google.com")) return;
   if (e.request.method !== "GET") return;
 
-  // Network-first for app shell so v26+ logic reaches phones stuck on old caches.
+  // Network-first for app shell so v27+ logic reaches phones stuck on old caches.
   if (isShellRequest(e.request.url) || e.request.mode === "navigate") {
     e.respondWith(
       fetch(e.request)
