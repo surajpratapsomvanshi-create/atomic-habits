@@ -849,6 +849,27 @@ function formatLastUsedClock(iso) {
   });
 }
 
+/** Build the bad-habit day-spine use timeline nodes (text-safe). */
+function fillUseTimeline(listEl, clocks) {
+  if (!listEl || !clocks || !clocks.length) return;
+  const frag = document.createDocumentFragment();
+  const last = clocks.length - 1;
+  clocks.forEach((clock, i) => {
+    const li = document.createElement("li");
+    li.className = "use-tl-node" + (i === last ? " latest" : "");
+    li.style.setProperty("--i", String(i));
+    const dot = document.createElement("span");
+    dot.className = "use-tl-dot";
+    dot.setAttribute("aria-hidden", "true");
+    const time = document.createElement("time");
+    time.className = "use-tl-time";
+    time.textContent = clock;
+    li.append(dot, time);
+    frag.appendChild(li);
+  });
+  listEl.appendChild(frag);
+}
+
 function laterIso(a, b) {
   const ta = a ? Date.parse(a) : NaN;
   const tb = b ? Date.parse(b) : NaN;
@@ -1252,7 +1273,7 @@ function renderBadHabitCard(h) {
     .map(formatLastUsedClock)
     .filter(Boolean);
   const useTimesHtml = dayUseClocks.length
-    ? `<div class="habit-use-times" aria-label="Use times"></div>`
+    ? `<div class="habit-use-timeline" aria-label="Use times"><ol class="use-tl-list"></ol></div>`
     : "";
 
   const alertHtml = [
@@ -1284,8 +1305,7 @@ function renderBadHabitCard(h) {
   card.querySelector(".habit-pill.schedule").textContent = scheduleLabel(h);
   card.querySelectorAll(".habit-warn").forEach((el, i) => { el.textContent = warnings[i]; });
   card.querySelectorAll(".habit-tip").forEach((el, i) => { el.textContent = tips[i]; });
-  const useTimesEl = card.querySelector(".habit-use-times");
-  if (useTimesEl) useTimesEl.textContent = dayUseClocks.join(" · ");
+  fillUseTimeline(card.querySelector(".use-tl-list"), dayUseClocks);
   if (overLimit) {
     const val = card.querySelector(".counter-value");
     val.classList.add("over");
