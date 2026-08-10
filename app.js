@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "33";
+const APP_VERSION = "34";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -48,9 +48,13 @@ const EDIT_ICON =
 const DRAG_HANDLE =
   `<button class="habit-drag" type="button" aria-label="Drag to reorder" title="Drag to reorder"><span aria-hidden="true">⋮⋮</span></button>`;
 
-let data = migrateData(load(LS_DATA, { habits: [], checks: {}, counts: {} }));
+const _bootRaw = load(LS_DATA, { habits: [], checks: {}, counts: {} });
+const _bootRawPunchSig = JSON.stringify((_bootRaw && _bootRaw.punches) || []);
+let data = migrateData(_bootRaw);
 // Persist migrate heals (orphan lastUsedAt → punch, count→timeline backfill) immediately.
 saveData();
+/** Set when migrate/heal invents punches so the next armed sync uploads them. */
+let healPendingUpload = JSON.stringify(data.punches || []) !== _bootRawPunchSig;
 
 /**
  * Re-run punch/count/lastUsed heals when mid-session drift appears
@@ -66,8 +70,12 @@ function healDataDrift() {
     c: data.counts,
     l: data.lastUsedAt,
   });
-  promoteOrphanLastUsedIntoPunches(data.punches, data.lastUsedAt);
+  // Drop legacy random-id synthetics, then rebuild with stable ids/times.
+  data.punches = stripSyntheticPunches(data.punches);
+  // Backfill first (uses lastUsedAt as newest slot); promote only adds a
+  // newer orphan clock that counts did not already cover.
   backfillCountGapsIntoPunches(data.punches, data.counts, data.lastUsedAt);
+  promoteOrphanLastUsedIntoPunches(data.punches, data.lastUsedAt);
   data.counts = reconcileCountsFromPunches(data.counts, data.punches);
   reconcileLastUsedAtFromPunches(data.lastUsedAt, data.punches);
   const after = JSON.stringify({
@@ -75,7 +83,21 @@ function healDataDrift() {
     c: data.counts,
     l: data.lastUsedAt,
   });
-  return before !== after;
+  const changed = before !== after;
+  if (changed) {
+    localDirty = true;
+    healPendingUpload = true;
+  }
+  return changed;
+}
+
+/** Queue an upload after heal invents punches (once sync is armed). */
+function queueHealUpload() {
+  if (!healPendingUpload && !localDirty) return;
+  if (!settings.scriptUrl || !settings.autoSync) return;
+  if (!autoSyncArmed) return;
+  healPendingUpload = false;
+  queueSync();
 }
 
 /** True when stored day count, punch times, or lastUsedAt disagree for habit/day. */
@@ -117,7 +139,7 @@ let autoSyncArmed = false;
 /** True once initSync has finished its first cloud check. */
 let cloudChecked = false;
 /** Local edits waiting to push (set by queueSync, cleared after successful upload/restore). */
-let localDirty = false;
+let localDirty = !!healPendingUpload;
 /** Timestamp of last user edit — used to debounce mid-tap cloud pulls. */
 let lastUserEditAt = 0;
 /** Periodic cloud refresh timer. */
@@ -233,13 +255,14 @@ function migrateData(raw) {
   });
 
   const checks = raw.checks && typeof raw.checks === "object" ? raw.checks : {};
-  const punches = migratePunches(raw.punches);
+  // Strip legacy random-id synthetics before heal so every device rebuilds
+  // the same deterministic gap/orphan punches from counts + lastUsedAt.
+  const punches = stripSyntheticPunches(migratePunches(raw.punches));
   const lastUsedAt = migrateLastUsedAt(raw.lastUsedAt);
   const countsIn = raw.counts && typeof raw.counts === "object" ? raw.counts : {};
-  // Real clock from lastUsedAt that never became a punch (legacy +/sync) → punch row.
-  promoteOrphanLastUsedIntoPunches(punches, lastUsedAt);
-  // Keep the stored day totals: invent missing punch nodes so timeline length ≡ count.
+  // Count gaps first (lastUsedAt becomes newest slot); then promote any newer orphan.
   backfillCountGapsIntoPunches(punches, countsIn, lastUsedAt);
+  promoteOrphanLastUsedIntoPunches(punches, lastUsedAt);
   const counts = reconcileCountsFromPunches(countsIn, punches);
   reconcileLastUsedAtFromPunches(lastUsedAt, punches);
   let activeListId = raw.activeListId != null ? String(raw.activeListId) : fallbackListId;
@@ -379,11 +402,79 @@ function reconcileCountsFromPunches(countsIn, punches) {
 }
 
 /**
+ * Heal / backfill punches are device-invented. Their ids used to include
+ * Math.random(), so two phones filled the same count gap with different ids;
+ * merge-by-id then kept BOTH and counts diverged forever.
+ * Detect synthetics so merge can drop them and rebuild deterministically.
+ */
+function isSyntheticPunchId(id) {
+  const s = String(id || "");
+  return (
+    s.startsWith("p-bf-") ||
+    s.startsWith("p-orphan-") ||
+    s.startsWith("p-bf-gap-") ||
+    s.startsWith("p-bf-lu-")
+  );
+}
+
+function stripSyntheticPunches(punches) {
+  if (!Array.isArray(punches)) return [];
+  return punches.filter(p => p && !isSyntheticPunchId(p.id));
+}
+
+/** Stable 32-bit hash for deterministic backfill ids/times (same input → same out). */
+function stableHash32(str) {
+  let h = 2166136261;
+  const s = String(str || "");
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+/** Local-calendar ms for YYYY-MM-DD at hour:minute:second (day key stays correct). */
+function localDayWallMs(day, hour, minute, second) {
+  const [y, m, d] = String(day).split("-").map(Number);
+  return new Date(y, m - 1, d, hour || 0, minute || 0, second || 0).getTime();
+}
+
+/**
+ * Deterministic ISO timestamp for gap slot i of habit/day.
+ * Derived from day + habitId + index hash so devices never invent different clocks.
+ */
+function deterministicGapAtIso(habitId, day, index, gap, anchorMs) {
+  const STEP_MS = 60 * 1000;
+  const id = String(habitId || "");
+  const d = String(day || "");
+  const i = Math.max(0, Math.floor(Number(index) || 0));
+  const g = Math.max(1, Math.floor(Number(gap) || 1));
+  let ms;
+  if (Number.isFinite(anchorMs)) {
+    ms = anchorMs - (g - i) * STEP_MS;
+  } else {
+    // No known punch: place in mid-morning band via hash (stable across devices).
+    const h = stableHash32(id + "|" + d + "|" + i);
+    const minuteOfDay = 8 * 60 + (h % (10 * 60)); // 08:00–17:59
+    ms = localDayWallMs(d, Math.floor(minuteOfDay / 60), minuteOfDay % 60, (h % 50));
+  }
+  if (dateStr(new Date(ms)) !== d) {
+    ms = localDayWallMs(d, 0, 1 + i, (stableHash32(id + d + i) % 50));
+  }
+  return new Date(ms).toISOString();
+}
+
+/** Stable id for a count-gap backfill punch (no Math.random). */
+function deterministicGapPunchId(habitId, day, index) {
+  return "p-bf-gap-" + String(habitId) + "-" + String(day).replace(/-/g, "") + "-" + index;
+}
+
+/**
  * Heal legacy gaps: when counts[day][habitId] = N but fewer than N unmatched +
  * punches exist for that day, insert synthetic + punches so the timeline shows
  * every use. Known clocks (existing punches / lastUsedAt on that day) are kept;
- * remaining unknowns are staggered one minute apart just before the earliest
- * known punch (or before local noon if none).
+ * remaining unknowns use deterministic times from day+habitId+index (same on
+ * every device — never Math.random / Date.now).
  *
  * Gap punches are inserted *before* the first existing + for that habit/day in
  * the log so stack order stays chronological and lastUsed stays the newest node.
@@ -393,7 +484,6 @@ function backfillCountGapsIntoPunches(punches, counts, lastUsedAt) {
   if (!Array.isArray(punches)) return punches;
   if (!counts || typeof counts !== "object") return punches;
   const lastMap = lastUsedAt && typeof lastUsedAt === "object" ? lastUsedAt : {};
-  const STEP_MS = 60 * 1000;
 
   for (const day of Object.keys(counts)) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
@@ -419,7 +509,7 @@ function backfillCountGapsIntoPunches(punches, counts, lastUsedAt) {
         });
         if (!already) {
           punches.push({
-            id: "p-bf-lu-" + id + "-" + day + "-" + luMs.toString(36),
+            id: "p-bf-lu-" + id + "-" + day.replace(/-/g, "") + "-" + luMs.toString(36),
             habitId: id,
             at: new Date(luMs).toISOString(),
             delta: 1,
@@ -435,13 +525,7 @@ function backfillCountGapsIntoPunches(punches, counts, lastUsedAt) {
         .map(x => Date.parse(x.at))
         .filter(Number.isFinite)
         .sort((a, b) => a - b);
-      let anchorMs;
-      if (knownMs.length) {
-        anchorMs = knownMs[0];
-      } else {
-        const [y, m, d] = day.split("-").map(Number);
-        anchorMs = new Date(y, m - 1, d, 12, 0, 0).getTime();
-      }
+      const anchorMs = knownMs.length ? knownMs[0] : NaN;
 
       // Insert older unknowns before the first + for this habit/day (keep last = newest).
       let insertAt = -1;
@@ -457,16 +541,10 @@ function backfillCountGapsIntoPunches(punches, counts, lastUsedAt) {
 
       const toInsert = [];
       for (let i = 0; i < gap; i++) {
-        let ms = anchorMs - (gap - i) * STEP_MS;
-        if (dateStr(new Date(ms)) !== day) {
-          const [y, m, d] = day.split("-").map(Number);
-          ms = new Date(y, m - 1, d, 0, 1 + i, 0).getTime();
-        }
         toInsert.push({
-          id: "p-bf-gap-" + id + "-" + day.replace(/-/g, "") + "-" + i + "-" +
-            Math.random().toString(36).slice(2, 6),
+          id: deterministicGapPunchId(id, day, i),
           habitId: id,
-          at: new Date(ms).toISOString(),
+          at: deterministicGapAtIso(id, day, i, gap, anchorMs),
           delta: 1,
           day,
         });
@@ -1146,16 +1224,7 @@ function recordPunch(habitId, delta, day) {
   const stored = getCount(id, dayKey);
   const gap = Math.max(0, stored - existing.length);
   if (gap > 0) {
-    const baseMs = Date.parse(at) - gap * 60000;
-    for (let i = 0; i < gap; i++) {
-      data.punches.push({
-        id: "p-bf-" + Date.now().toString(36) + i + Math.random().toString(36).slice(2, 5),
-        habitId: id,
-        at: new Date(baseMs + i * 60000).toISOString(),
-        delta: 1,
-        day: dayKey,
-      });
-    }
+    backfillCountGapsIntoPunches(data.punches, data.counts, data.lastUsedAt);
   }
 
   data.punches.push({
@@ -1489,7 +1558,10 @@ function completionRate(habitId) {
 /* ---------------- rendering ---------------- */
 function render() {
   // Heal count↔timeline↔lastUsed drift before paint (selected day + all days).
-  if (healDataDrift()) saveData();
+  if (healDataDrift()) {
+    saveData();
+    queueHealUpload();
+  }
   renderListTabs();
   renderDateStrip();
   renderHabits();
@@ -1698,7 +1770,10 @@ function renderBadHabitCard(h) {
   if (
     (dayViewDrift(h.id, selectedDate) || dayViewDrift(h.id, prevDate))
     && healDataDrift()
-  ) saveData();
+  ) {
+    saveData();
+    queueHealUpload();
+  }
 
   // One array drives count, timeline, and last-used clock — they cannot diverge.
   const dayView = badDayView(h.id, selectedDate);
@@ -2563,7 +2638,12 @@ function mergeHabitData(localData, cloudData) {
   }
 
   const punchById = new Map();
-  for (const p of [...(cld.punches || []), ...(loc.punches || [])]) {
+  // Union only real (user) punches. Synthetic heal punches are dropped and
+  // rebuilt deterministically below so two devices never keep divergent random ids.
+  for (const p of [
+    ...stripSyntheticPunches(cld.punches || []),
+    ...stripSyntheticPunches(loc.punches || []),
+  ]) {
     if (!p || !p.id) continue;
     const key = String(p.id);
     if (!punchById.has(key)) punchById.set(key, p);
@@ -2575,7 +2655,7 @@ function mergeHabitData(localData, cloudData) {
   // Counts: start from cloud, apply deltas from punches only present locally.
   // Math.max alone drops undos when the other device still has the higher count.
   const cloudPunchIds = new Set(
-    (cld.punches || []).filter(p => p && p.id).map(p => String(p.id))
+    stripSyntheticPunches(cld.punches || []).filter(p => p && p.id).map(p => String(p.id))
   );
   const counts = {};
   for (const day of Object.keys(cld.counts || {})) {
@@ -2588,7 +2668,7 @@ function mergeHabitData(localData, cloudData) {
     if (Object.keys(copy).length) counts[day] = copy;
   }
   const localOnlyPunchKeys = new Set(); // day\0habitId touched by local-only punches
-  for (const p of loc.punches || []) {
+  for (const p of stripSyntheticPunches(loc.punches || [])) {
     if (!p || !p.id || cloudPunchIds.has(String(p.id))) continue;
     const day = punchDay(p);
     if (!day) continue;
@@ -2624,6 +2704,10 @@ function mergeHabitData(localData, cloudData) {
     ...Object.keys(cld.lastUsedAt || {}),
     ...Object.keys(loc.lastUsedAt || {}),
     ...punches.map(p => String(p.habitId)),
+    ...Object.keys(counts).reduce((acc, day) => {
+      const row = counts[day] || {};
+      return acc.concat(Object.keys(row));
+    }, []),
   ]);
   for (const id of usedIds) {
     const fromStack = lastUsedAtFromPunchesList(punches, id);
@@ -2632,21 +2716,33 @@ function mergeHabitData(localData, cloudData) {
       (loc.lastUsedAt && loc.lastUsedAt[id]) || null
     );
     if (fromStack) {
-      // Keep a newer map clock (orphan lastUsedAt) so migrate can promote it
-      // into a punch — otherwise 09:29-style stamps vanish while counts stay high.
+      // Keep a newer map clock (orphan lastUsedAt) so heal can promote it.
       lastUsedAt[id] = laterIso(fromStack, fromMaps) || fromStack;
       continue;
     }
-    // Stack empty with punches for this habit → undos canceled all +; clear.
+    // Real punches existed but undos canceled all + → clear (do not resurrect map).
     const hadPunches = punches.some(p => p && String(p.habitId) === id);
     if (hadPunches) continue;
+    // No real punches: map clocks often came from stripped random synthetics.
+    // Keep the map only so backfill can use it as the newest slot; promote
+    // + backfill will invent the same deterministic rows on every device.
     if (fromMaps) lastUsedAt[id] = fromMaps;
   }
+
+  // Rebuild synthetic gap/orphan punches once, identically on every device.
+  backfillCountGapsIntoPunches(punches, counts, lastUsedAt);
+  promoteOrphanLastUsedIntoPunches(punches, lastUsedAt);
+  const countsFinal = reconcileCountsFromPunches(counts, punches);
+  reconcileLastUsedAtFromPunches(lastUsedAt, punches);
+  punches.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  if (punches.length > MAX_PUNCHES) punches = punches.slice(-MAX_PUNCHES);
 
   let activeListId = loc.activeListId || cld.activeListId || fallbackListId;
   if (!listIds.has(String(activeListId))) activeListId = fallbackListId;
 
-  const deduped = dedupeHabitsByName({ habits, checks, counts, lastUsedAt, punches, lists, activeListId });
+  const deduped = dedupeHabitsByName({
+    habits, checks, counts: countsFinal, lastUsedAt, punches, lists, activeListId,
+  });
   return migrateData(deduped);
 }
 
@@ -2906,6 +3002,8 @@ async function initSync() {
     } else {
       setSyncIndicator("ok", cloud.hasData ? "Ready" : "Cloud empty — this device will seed it");
     }
+    // Startup/heal may have invented deterministic punches — push so peers converge.
+    if (localDirty || healPendingUpload) queueHealUpload();
     startPolling();
     return;
   }
@@ -3044,16 +3142,21 @@ async function restoreFromSheet(opts) {
     if (!out.ok) throw new Error(out.error || "Unknown error");
     if (out.data && Array.isArray(out.data.habits)) {
       const backedUp = makeLocalBackup();
+      const rawPunchSig = JSON.stringify((out.data && out.data.punches) || []);
       data = migrateData(out.data);
       saveData();
       rememberRevision(out);
       settings.lastSync = new Date().toISOString();
       saveSettings();
       autoSyncArmed = true;
-      localDirty = false;
+      // If restore migrated random synthetics → deterministic, push so peers match.
+      const healed = JSON.stringify(data.punches || []) !== rawPunchSig;
+      localDirty = healed;
+      healPendingUpload = healed;
       lastPullAt = Date.now();
       render();
       updateSyncSafetyText(out);
+      if (healed) queueHealUpload();
       const rev = out.revision != null ? " · rev " + out.revision : "";
       setSyncIndicator("ok", (opts.auto ? "Loaded from Google Sheet" : "Restored from cloud") + rev);
       if (opts.toastMsg) toast(opts.toastMsg);
@@ -3495,6 +3598,10 @@ try {
     reconcileCountsFromPunches,
     applyCountDelta,
     migrateData,
+    isSyntheticPunchId,
+    stripSyntheticPunches,
+    deterministicGapPunchId,
+    deterministicGapAtIso,
     APP_VERSION,
     createList,
     renameList,
