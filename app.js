@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "34";
+const APP_VERSION = "35";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -2552,6 +2552,64 @@ function cloudSafeToOverwrite(cloud) {
          String(settings.lastSeenRevision) === String(cloud.revision);
 }
 
+/**
+ * Score today's activity in a snapshot. Used to block Upload from a device
+ * that is missing today's punches when cloud already has them.
+ */
+function todayActivityScore(d, day) {
+  day = day || todayStr();
+  if (!d) return { punches: 0, checks: 0, countSum: 0, score: 0 };
+  let punches = 0;
+  for (const p of stripSyntheticPunches(d.punches || [])) {
+    if (punchDay(p) === day && Number(p.delta) > 0) punches++;
+  }
+  const checks = ((d.checks && d.checks[day]) || []).length;
+  let countSum = 0;
+  const row = (d.counts && d.counts[day]) || {};
+  for (const id of Object.keys(row)) countSum += Math.max(0, Number(row[id]) || 0);
+  return {
+    punches,
+    checks,
+    countSum,
+    score: punches * 100 + checks * 10 + countSum,
+  };
+}
+
+/** True when cloud has today's check-ins/punches that local is missing. */
+function cloudHasRicherToday(localData, cloudData) {
+  const local = todayActivityScore(localData);
+  const cloud = todayActivityScore(cloudData);
+  if (cloud.score <= 0) return false;
+  if (cloud.punches > 0 && local.punches === 0) return true;
+  return cloud.score > local.score;
+}
+
+/**
+ * Before a blind push: if this device has no (or fewer) today punches than
+ * cloud, merge instead of overwriting. Returns true if it handled sync.
+ */
+async function guardUploadAgainstLosingToday(opts) {
+  opts = opts || {};
+  const localToday = todayActivityScore(data);
+  // Local already has today's activity → allow normal upload.
+  if (localToday.punches > 0 || localToday.score > 0) return false;
+  let loaded;
+  try {
+    loaded = await fetchCloudSnapshot();
+  } catch (_) {
+    return false;
+  }
+  if (!loaded || !loaded.data) return false;
+  if (!cloudHasRicherToday(data, loaded.data)) return false;
+  updateSyncSafetyText(loaded);
+  setSyncIndicator("pending", "Cloud has today's check-ins — merging…");
+  if (!opts.silent) {
+    toast("Cloud has today's check-ins — merging (not overwriting)");
+  }
+  await resolveConflictAuto(loaded, { silent: opts.silent, auto: !!opts.auto });
+  return true;
+}
+
 function rememberRevision(out) {
   if (out && out.revision != null) {
     settings.lastSeenRevision = out.revision;
@@ -3100,6 +3158,15 @@ async function syncNow(opts) {
       return;
     }
     autoSyncArmed = true;
+  }
+
+  // Device missing today's punches must not clobber cloud that has them.
+  try {
+    if (await guardUploadAgainstLosingToday(opts)) return;
+  } catch (err) {
+    setSyncIndicator("error", "Upload blocked: " + (err && err.message ? err.message : "sync guard failed"));
+    if (!opts.silent) toast("Upload blocked — cloud may have today's check-ins");
+    return;
   }
 
   setSyncIndicator("pending", opts.silent ? "Syncing…" : "Uploading…");

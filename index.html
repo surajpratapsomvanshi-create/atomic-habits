@@ -99,7 +99,7 @@
           <span class="card-icon" aria-hidden="true">☁</span> Google Sheets sync
           <span id="sync-indicator" class="sync-indicator" title="Sync status" aria-label="Sync status">●</span>
         </h2>
-        <p class="muted">Data is saved as <b>Atomic Habits DB</b> in your Drive. Devices <b>auto-sync</b> with the Sheet (source of truth): new devices load the cloud copy, then refresh periodically. <b>Restore</b> pulls the latest Sheet; <b>Upload</b> pushes this device’s changes. Concurrent edits merge automatically when safe.</p>
+        <p class="muted">Data is saved as <b>Atomic Habits DB</b> in your Drive. Devices <b>auto-sync</b> with the Sheet (source of truth): new devices load the cloud copy, then refresh periodically. <b>Restore</b> pulls the latest Sheet; <b>Upload</b> pushes this device’s changes (blocked if this device is missing today’s check-ins that cloud already has — those are kept via merge). Concurrent edits merge automatically when safe.</p>
         <label class="field-label" for="script-url">Web App URL</label>
         <input type="url" id="script-url" placeholder="https://script.google.com/macros/s/…/exec" value="https://script.google.com/macros/s/AKfycbxxcZhrVNYDpg4ZUfFQNDGudJKUJENaQRRcoyMio8_YEdo5GoKscHAGyUhEd0iK9NkG/exec" />
         <label class="toggle-row">
