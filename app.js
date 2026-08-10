@@ -1294,73 +1294,106 @@ function useCompareDayLabel(day) {
   return DOW_LABELS[dt.getDay()] + " " + d;
 }
 
-/** Build one horizontal use-times chip row (one pill per use; text-safe). */
-function fillUseTimeline(listEl, clocks) {
-  if (!listEl) return;
-  listEl.replaceChildren();
-  if (!clocks || !clocks.length) return;
-  const frag = document.createDocumentFragment();
-  const last = clocks.length - 1;
-  clocks.forEach((clock, i) => {
-    const li = document.createElement("li");
-    li.className = "use-time-row" + (i === last ? " latest" : "");
-    const time = document.createElement("time");
-    time.className = "use-time-clock";
-    time.setAttribute("datetime", clock);
-    time.setAttribute("title", i === last ? "Latest · " + clock : clock);
-    time.textContent = clock;
-    li.appendChild(time);
-    frag.appendChild(li);
-  });
-  listEl.appendChild(frag);
+/** Minutes since local midnight for an HH:MM clock (clamped to the day). */
+function minutesFromClock(clock) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(clock || "").trim());
+  if (!m) return 0;
+  const hh = Math.min(23, Math.max(0, Number(m[1]) || 0));
+  const mm = Math.min(59, Math.max(0, Number(m[2]) || 0));
+  return hh * 60 + mm;
+}
+
+/** Proportional position on a 00:00–24:00 rail (0–100). */
+function clockToRailPct(clock) {
+  return (minutesFromClock(clock) / (24 * 60)) * 100;
 }
 
 /**
- * Fill a compare row: label on its own line, full-width times underneath.
- * Writes plain HH:MM text + chip spans so times stay visible even if chip CSS fails.
+ * Layout nodes on the day rail: proportional left%, slight separation for
+ * identical/near-identical times, and up/down label lanes so clocks never clip.
+ */
+function layoutUseRailNodes(clocks) {
+  const list = Array.isArray(clocks) ? clocks.filter(Boolean) : [];
+  const n = list.length;
+  if (!n) return [];
+  const MIN_SEP = 2.2;
+  const CLOSE = 8.5;
+  const pcts = list.map(clockToRailPct);
+  for (let i = 1; i < n; i++) {
+    if (pcts[i] - pcts[i - 1] < MIN_SEP) {
+      pcts[i] = Math.min(100, pcts[i - 1] + MIN_SEP);
+    }
+  }
+  // If right-edge overflow from nudging, compress slightly from the right.
+  if (pcts[n - 1] > 100) {
+    const overflow = pcts[n - 1] - 100;
+    for (let i = 0; i < n; i++) pcts[i] = Math.max(0, pcts[i] - overflow * (i / (n - 1 || 1)));
+  }
+  const lanes = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    let lane = i % 2;
+    if (i > 0 && Math.abs(pcts[i] - pcts[i - 1]) < CLOSE) {
+      lane = 1 - lanes[i - 1];
+    }
+    lanes[i] = lane;
+  }
+  const last = n - 1;
+  return list.map((clock, i) => ({
+    clock,
+    pct: pcts[i],
+    lane: lanes[i],
+    latest: i === last,
+  }));
+}
+
+/**
+ * Fill one day rail: soft 00→24 track with proportional nodes + HH:MM labels.
+ * Count N → N nodes. Empty days keep a muted rail + "No uses".
  */
 function fillUseCompareRow(rowEl, clocks) {
   if (!rowEl) return;
-  const scroll = rowEl.querySelector(".use-times-scroll");
-  const list = rowEl.querySelector(".use-times-list");
-  const plain = rowEl.querySelector(".use-times-plain");
+  const track = rowEl.querySelector(".use-rail-track");
   const empty = rowEl.querySelector(".use-times-empty");
-  if (!scroll || !empty) return;
-  const has = Array.isArray(clocks) && clocks.length > 0;
-  if (list) list.classList.add("hidden");
-  if (plain) plain.classList.toggle("hidden", !has);
+  const sr = rowEl.querySelector(".use-rail-sr");
+  if (!track || !empty) return;
+  const nodes = layoutUseRailNodes(clocks);
+  const has = nodes.length > 0;
   empty.classList.toggle("hidden", has);
-  rowEl.setAttribute("data-times", has ? clocks.join(" ") : "");
-  if (has) {
-    // Primary: chip spans inside plain container (full-width rail under label).
-    if (plain) {
-      plain.replaceChildren();
-      const frag = document.createDocumentFragment();
-      const last = clocks.length - 1;
-      clocks.forEach((clock, i) => {
-        const time = document.createElement("time");
-        time.className = "use-time-clock" + (i === last ? " latest" : "");
-        time.setAttribute("datetime", clock);
-        time.setAttribute("title", i === last ? "Latest · " + clock : clock);
-        time.textContent = clock;
-        frag.appendChild(time);
-        if (i < last) frag.appendChild(document.createTextNode(" "));
-      });
-      // Also mirror as a single text node attribute for View Source checks.
-      plain.setAttribute("data-times-text", clocks.join("  "));
-      plain.appendChild(frag);
-    }
-    if (list) fillUseTimeline(list, clocks);
-    // Start at the left so the first clocks are always on-screen.
-    requestAnimationFrame(() => { scroll.scrollLeft = 0; });
-  } else {
-    if (list) list.replaceChildren();
-    if (plain) {
-      plain.replaceChildren();
-      plain.removeAttribute("data-times-text");
-    }
-    empty.textContent = "No uses";
+  empty.textContent = "No uses";
+  rowEl.classList.toggle("is-empty", !has);
+  rowEl.setAttribute("data-times", has ? nodes.map(x => x.clock).join(" ") : "");
+  track.replaceChildren();
+  if (sr) {
+    sr.textContent = has ? nodes.map(x => x.clock).join(", ") : "No uses";
   }
+  if (!has) return;
+
+  const frag = document.createDocumentFragment();
+  nodes.forEach((node, i) => {
+    const el = document.createElement("div");
+    el.className = "use-node"
+      + (node.lane === 1 ? " lane-below" : " lane-above")
+      + (node.latest ? " latest" : "");
+    el.style.setProperty("--pct", String(node.pct));
+    el.setAttribute("title", node.latest ? "Latest · " + node.clock : node.clock);
+    el.setAttribute("data-clock", node.clock);
+
+    const dot = document.createElement("span");
+    dot.className = "use-node-dot";
+    dot.setAttribute("aria-hidden", "true");
+
+    const time = document.createElement("time");
+    time.className = "use-node-label";
+    time.setAttribute("datetime", node.clock);
+    time.textContent = node.clock;
+
+    el.appendChild(dot);
+    el.appendChild(time);
+    // Stagger entrance slightly for a calm motion (respect reduced-motion in CSS).
+    el.style.setProperty("--i", String(i));
+    frag.appendChild(el);
+  });
+  track.appendChild(frag);
 }
 
 /** Label + count badge for a compare row (e.g. "Today · 6"). */
@@ -1818,18 +1851,25 @@ function renderBadHabitCard(h) {
     ? `<div class="habit-use-times" aria-label="Use times: ${selLabel} vs ${prevLabel}">
          <div class="use-times-day" data-role="selected" data-times="">
            <div class="use-times-day-label"></div>
-           <div class="use-times-scroll">
-             <div class="use-times-plain"></div>
-             <ol class="use-times-list"></ol>
-             <span class="use-times-empty hidden">No uses</span>
+           <div class="use-rail">
+             <div class="use-rail-scale" aria-hidden="true">
+               <span>00</span><span>06</span><span>12</span><span>18</span><span>24</span>
+             </div>
+             <div class="use-rail-body">
+               <div class="use-rail-track"></div>
+               <span class="use-times-empty hidden">No uses</span>
+             </div>
+             <span class="use-rail-sr visually-hidden"></span>
            </div>
          </div>
          <div class="use-times-day" data-role="prev" data-times="">
            <div class="use-times-day-label"></div>
-           <div class="use-times-scroll">
-             <div class="use-times-plain"></div>
-             <ol class="use-times-list"></ol>
-             <span class="use-times-empty hidden">No uses</span>
+           <div class="use-rail use-rail-prev">
+             <div class="use-rail-body">
+               <div class="use-rail-track"></div>
+               <span class="use-times-empty hidden">No uses</span>
+             </div>
+             <span class="use-rail-sr visually-hidden"></span>
            </div>
          </div>
        </div>`
@@ -1852,14 +1892,14 @@ function renderBadHabitCard(h) {
        </div>
        ${lastUsedHtml}
        ${alertHtml ? `<div class="habit-alerts">${alertHtml}</div>` : ""}
-       ${useTimesHtml}
      </div>` +
     `<button class="habit-edit" title="Edit" type="button" aria-label="Edit habit">${EDIT_ICON}</button>` +
     `<div class="counter-controls" role="group" aria-label="Counter">
        <button class="counter-btn dec" type="button" aria-label="Decrease"${future ? " disabled" : ""}>−</button>
        <span class="counter-value" aria-live="polite">${count}</span>
        <button class="counter-btn inc" type="button" aria-label="Increase"${future ? " disabled" : ""}>+</button>
-     </div>`;
+     </div>` +
+    useTimesHtml;
   card.querySelector(".habit-name").textContent = h.name;
   card.querySelector(".habit-pill.schedule").textContent = scheduleLabel(h);
   card.querySelectorAll(".habit-warn").forEach((el, i) => { el.textContent = warnings[i]; });
