@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "35";
+const APP_VERSION = "36";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -2598,10 +2598,15 @@ function cloudSafeToOverwrite(cloud) {
  */
 function todayActivityScore(d, day) {
   day = day || todayStr();
-  if (!d) return { punches: 0, checks: 0, countSum: 0, score: 0 };
+  if (!d) return { punches: 0, checks: 0, countSum: 0, byHabit: {}, score: 0 };
+  const byHabit = {};
   let punches = 0;
   for (const p of stripSyntheticPunches(d.punches || [])) {
-    if (punchDay(p) === day && Number(p.delta) > 0) punches++;
+    if (punchDay(p) !== day || !(Number(p.delta) > 0)) continue;
+    punches++;
+    const id = String(p.habitId || "");
+    if (!id) continue;
+    byHabit[id] = (byHabit[id] || 0) + 1;
   }
   const checks = ((d.checks && d.checks[day]) || []).length;
   let countSum = 0;
@@ -2611,6 +2616,7 @@ function todayActivityScore(d, day) {
     punches,
     checks,
     countSum,
+    byHabit,
     score: punches * 100 + checks * 10 + countSum,
   };
 }
@@ -2619,20 +2625,38 @@ function todayActivityScore(d, day) {
 function cloudHasRicherToday(localData, cloudData) {
   const local = todayActivityScore(localData);
   const cloud = todayActivityScore(cloudData);
-  if (cloud.score <= 0) return false;
-  if (cloud.punches > 0 && local.punches === 0) return true;
+  if (cloud.score <= 0 && cloud.punches <= 0 && cloud.checks <= 0) return false;
+  if (cloud.punches > local.punches) return true;
+  if (cloud.checks > local.checks) return true;
+  // Any habit where cloud has more real + punches today than local.
+  const ids = new Set([
+    ...Object.keys(cloud.byHabit || {}),
+    ...Object.keys(local.byHabit || {}),
+  ]);
+  for (const id of ids) {
+    if ((cloud.byHabit[id] || 0) > (local.byHabit[id] || 0)) return true;
+  }
+  // Cloud has punch ids for today that local lacks.
+  const day = todayStr();
+  const localIds = new Set(
+    stripSyntheticPunches((localData && localData.punches) || [])
+      .filter(p => punchDay(p) === day)
+      .map(p => String(p.id))
+  );
+  for (const p of stripSyntheticPunches((cloudData && cloudData.punches) || [])) {
+    if (punchDay(p) === day && p && p.id && !localIds.has(String(p.id))) return true;
+  }
   return cloud.score > local.score;
 }
 
 /**
- * Before a blind push: if this device has no (or fewer) today punches than
- * cloud, merge instead of overwriting. Returns true if it handled sync.
+ * Before a blind push: if cloud has today's punches this device is missing,
+ * merge instead of overwriting (even when local has partial today activity).
+ * Returns true if it handled sync. opts.force skips the guard (master upload).
  */
 async function guardUploadAgainstLosingToday(opts) {
   opts = opts || {};
-  const localToday = todayActivityScore(data);
-  // Local already has today's activity → allow normal upload.
-  if (localToday.punches > 0 || localToday.score > 0) return false;
+  if (opts.force) return false;
   let loaded;
   try {
     loaded = await fetchCloudSnapshot();
@@ -2670,11 +2694,10 @@ function dataHasHabits(d) {
 /**
  * Merge local pending edits onto cloud (source of truth base):
  * lists + habits by id (cloud wins on same id), checks union,
- * counts = cloud base + local-only punch deltas (so − undos survive;
- * Math.max alone wrongly kept the higher pre-undo count),
- * punches union by id; lastUsedAt is derived from the merged punch stack
- * (so − undos win over a stale later map value). Legacy map-only habits
- * (no punches) still take the later timestamp / max count.
+ * punches union by id; counts reconciled FROM merged punches only
+ * (no Math.max inflation). Legacy map-only habit/days (no punches on
+ * either side) prefer cloud count, else local. lastUsedAt is derived
+ * from the merged punch stack (so − undos win over a stale later map).
  * Returns null if merge isn't cleanly possible.
  */
 function mergeHabitData(localData, cloudData) {
@@ -2750,30 +2773,9 @@ function mergeHabitData(localData, cloudData) {
   punches.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
   if (punches.length > MAX_PUNCHES) punches = punches.slice(-MAX_PUNCHES);
 
-  // Counts: start from cloud, apply deltas from punches only present locally.
-  // Math.max alone drops undos when the other device still has the higher count.
-  const cloudPunchIds = new Set(
-    stripSyntheticPunches(cld.punches || []).filter(p => p && p.id).map(p => String(p.id))
-  );
-  const counts = {};
-  for (const day of Object.keys(cld.counts || {})) {
-    const row = cld.counts[day] || {};
-    const copy = {};
-    for (const id of Object.keys(row)) {
-      const n = Number(row[id]) || 0;
-      if (n > 0) copy[id] = n;
-    }
-    if (Object.keys(copy).length) counts[day] = copy;
-  }
-  const localOnlyPunchKeys = new Set(); // day\0habitId touched by local-only punches
-  for (const p of stripSyntheticPunches(loc.punches || [])) {
-    if (!p || !p.id || cloudPunchIds.has(String(p.id))) continue;
-    const day = punchDay(p);
-    if (!day) continue;
-    localOnlyPunchKeys.add(day + "\0" + String(p.habitId));
-    applyCountDelta(counts, day, p.habitId, p.delta);
-  }
-  // Legacy / backfill: days with no local-only punches take max(cloud, local).
+  // Counts: prefer punch-derived totals only (no Math.max inflation).
+  // Legacy habit/days with zero punches on either side: cloud count, else local.
+  let counts = reconcileCountsFromPunches({}, punches);
   const countDates = new Set([
     ...Object.keys(cld.counts || {}),
     ...Object.keys(loc.counts || {}),
@@ -2783,17 +2785,16 @@ function mergeHabitData(localData, cloudData) {
     const b = (loc.counts && loc.counts[day]) || {};
     const ids = new Set([...Object.keys(a), ...Object.keys(b)]);
     for (const id of ids) {
-      if (localOnlyPunchKeys.has(day + "\0" + String(id))) continue;
-      const max = Math.max(Number(a[id]) || 0, Number(b[id]) || 0);
-      if (max <= 0) {
-        if (counts[day]) {
-          delete counts[day][id];
-          if (!Object.keys(counts[day]).length) delete counts[day];
-        }
-        continue;
-      }
+      const hadPunch = punches.some(
+        p => p && String(p.habitId) === String(id) && punchDay(p) === day
+      );
+      if (hadPunch) continue; // already set from punch reconcile
+      const cloudN = Math.max(0, Number(a[id]) || 0);
+      const localN = Math.max(0, Number(b[id]) || 0);
+      const keep = cloudN > 0 ? cloudN : localN; // cloud-first, never Math.max
+      if (keep <= 0) continue;
       if (!counts[day]) counts[day] = {};
-      counts[day][id] = max;
+      counts[day][id] = keep;
     }
   }
 
@@ -3100,6 +3101,19 @@ async function initSync() {
     } else {
       setSyncIndicator("ok", cloud.hasData ? "Ready" : "Cloud empty — this device will seed it");
     }
+    // Same revision can still diverge if this phone is missing today's cloud punches
+    // (heal / partial local). Pull those in before any heal upload.
+    if (cloud.hasData) {
+      try {
+        const loaded = await fetchCloudSnapshot();
+        if (loaded && loaded.data && cloudHasRicherToday(data, loaded.data)) {
+          setSyncIndicator("pending", "Cloud has today's check-ins — merging…");
+          await resolveConflictAuto(loaded, { auto: true, silent: true });
+          startPolling();
+          return;
+        }
+      } catch (_) { /* ignore; fall through */ }
+    }
     // Startup/heal may have invented deterministic punches — push so peers converge.
     if (localDirty || healPendingUpload) queueHealUpload();
     startPolling();
@@ -3126,9 +3140,20 @@ function queueSync() {
 /**
  * POST current `data` with baseRevision. Returns true on success.
  * On conflict, optionally auto-resolves (merge/pull) unless opts.skipResolve.
+ * opts.force → adopt current cloud revision as base so this device overwrites.
  */
 async function pushSnapshot(opts) {
   opts = opts || {};
+  if (opts.force) {
+    try {
+      const info = await fetchCloudInfo();
+      if (info && info.revision != null) {
+        settings.lastSeenRevision = info.revision;
+        settings.lastSeenUpdatedAt = info.updatedAt || new Date().toISOString();
+        saveSettings();
+      }
+    } catch (_) { /* proceed with last known base */ }
+  }
   const res = await fetch(settings.scriptUrl, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
@@ -3142,6 +3167,35 @@ async function pushSnapshot(opts) {
   const out = await res.json();
   if (out && out.conflict) {
     updateSyncSafetyText(out);
+    if (opts.force) {
+      // Retry once adopting the conflict revision as base.
+      if (out.revision != null) {
+        settings.lastSeenRevision = out.revision;
+        settings.lastSeenUpdatedAt = out.updatedAt || new Date().toISOString();
+        saveSettings();
+        const res2 = await fetch(settings.scriptUrl, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify({
+            action: "save",
+            data,
+            baseRevision: settings.lastSeenRevision,
+            deviceId: settings.deviceId,
+          }),
+        });
+        const out2 = await res2.json();
+        if (out2 && out2.ok) {
+          settings.lastSync = new Date().toISOString();
+          rememberRevision(out2);
+          saveSettings();
+          autoSyncArmed = true;
+          localDirty = false;
+          updateSyncSafetyText(out2);
+          return true;
+        }
+      }
+      return false;
+    }
     if (opts.skipResolve || opts.afterMerge) return false;
     await resolveConflictAuto(out, { silent: opts.silent });
     return autoSyncArmed && !localDirty;
@@ -3160,13 +3214,14 @@ async function pushSnapshot(opts) {
  * Upload this device's data to the cloud (optimistic concurrency).
  * On stale revision: auto-merge pending local edits onto cloud, or pull cloud.
  * opts.silent → quieter status (used by poll when pushing pending edits).
+ * opts.force → master overwrite (skips today-guard; adopts cloud rev as base).
  */
 async function syncNow(opts) {
   opts = opts || {};
   if (!settings.scriptUrl) { toast("Set the Web App URL in Settings first"); return; }
 
   // New/blank device with cloud data → restore first instead of uploading seeds.
-  if (isFreshLocal()) {
+  if (!opts.force && isFreshLocal()) {
     let cloud;
     try {
       cloud = await fetchCloudInfo();
@@ -3183,7 +3238,7 @@ async function syncNow(opts) {
       return;
     }
     autoSyncArmed = true;
-  } else if (!autoSyncArmed) {
+  } else if (!opts.force && !autoSyncArmed) {
     let cloud;
     try {
       cloud = await fetchCloudInfo();
@@ -3201,17 +3256,19 @@ async function syncNow(opts) {
   }
 
   // Device missing today's punches must not clobber cloud that has them.
-  try {
-    if (await guardUploadAgainstLosingToday(opts)) return;
-  } catch (err) {
-    setSyncIndicator("error", "Upload blocked: " + (err && err.message ? err.message : "sync guard failed"));
-    if (!opts.silent) toast("Upload blocked — cloud may have today's check-ins");
-    return;
+  if (!opts.force) {
+    try {
+      if (await guardUploadAgainstLosingToday(opts)) return;
+    } catch (err) {
+      setSyncIndicator("error", "Upload blocked: " + (err && err.message ? err.message : "sync guard failed"));
+      if (!opts.silent) toast("Upload blocked — cloud may have today's check-ins");
+      return;
+    }
   }
 
-  setSyncIndicator("pending", opts.silent ? "Syncing…" : "Uploading…");
+  setSyncIndicator("pending", opts.force ? "Uploading as master…" : (opts.silent ? "Syncing…" : "Uploading…"));
   try {
-    const ok = await pushSnapshot({ silent: opts.silent });
+    const ok = await pushSnapshot({ silent: opts.silent, force: !!opts.force });
     if (!ok) return;
     const rev = settings.lastSeenRevision != null ? " · rev " + settings.lastSeenRevision : "";
     setSyncIndicator("ok", "Uploaded: " + new Date(settings.lastSync).toLocaleString() + rev);
@@ -3220,6 +3277,15 @@ async function syncNow(opts) {
     setSyncIndicator("error", "Upload failed: " + err.message);
     if (!opts.silent) toast("Upload failed — data is safe locally");
   }
+}
+
+/** Explicit master upload — replaces cloud with this phone after confirm. */
+async function syncNowAsMaster() {
+  if (!settings.scriptUrl) { toast("Set the Web App URL in Settings first"); return; }
+  if (!confirm("Use this phone as master?\n\nThis replaces CLOUD data with THIS phone's copy. Only do this on the phone that has the correct entries (including today).")) {
+    return;
+  }
+  await syncNow({ force: true });
 }
 
 /** Save a timestamped local snapshot before restore overwrites local data. */
@@ -3241,7 +3307,7 @@ function makeLocalBackup() {
 async function restoreFromSheet(opts) {
   opts = opts || {};
   if (!settings.scriptUrl) { toast("Set the Web App URL in Settings first"); return false; }
-  if (!opts.skipConfirm && !confirm("Restore from cloud? A local backup will be saved first, then local data is replaced with the cloud copy.")) return false;
+  if (!opts.skipConfirm && !confirm("Replace this phone with cloud data?\n\nA local backup will be saved first, then this phone’s habits and today’s check-ins are replaced with the Google Sheet copy. Use this on the phone that is missing today’s entries.")) return false;
   setSyncIndicator("pending", opts.auto ? "Syncing…" : (opts.fromPoll ? "Refreshing…" : "Restoring…"));
   try {
     const res = await fetch(settings.scriptUrl + "?action=load");
@@ -3339,12 +3405,26 @@ async function pollCloud(opts) {
     cloudRev != null &&
     (seen == null || String(cloudRev) !== String(seen));
 
-  if (cloudAhead) {
-    if (localDirty || syncTimer) {
-      // Local has pending edits — try push; auto-merge on conflict.
+  // Always consider a full snapshot when cloud moved OR local is dirty —
+  // a dirty lagging phone must merge-in today's cloud punches, not blind-upload.
+  if (cloudAhead || localDirty || syncTimer) {
+    let loaded = null;
+    try {
+      loaded = await fetchCloudSnapshot();
+    } catch (_) {
+      loaded = null;
+    }
+    if (loaded && loaded.data && cloudHasRicherToday(data, loaded.data)) {
+      setSyncIndicator("pending", "Cloud has today's check-ins — merging…");
+      await resolveConflictAuto(loaded, { silent: true, auto: true, fromPoll: true });
+    } else if (cloudAhead) {
+      if (localDirty || syncTimer) {
+        await syncNow({ silent: true });
+      } else if (autoSyncArmed || seen != null) {
+        await restoreFromSheet({ skipConfirm: true, fromPoll: true });
+      }
+    } else if (localDirty || syncTimer) {
       await syncNow({ silent: true });
-    } else if (autoSyncArmed || seen != null) {
-      await restoreFromSheet({ skipConfirm: true, fromPoll: true });
     }
   }
 
@@ -3387,6 +3467,24 @@ function formatNextRefresh() {
 
 function updateSyncSafetyText(cloud) {
   const el = document.getElementById("sync-safety-text");
+  const revEl = document.getElementById("sync-rev-value");
+  const syncEl = document.getElementById("sync-last-sync");
+  const cloudRevEl = document.getElementById("sync-cloud-rev-value");
+  if (revEl) {
+    revEl.textContent = settings.lastSeenRevision != null
+      ? String(settings.lastSeenRevision)
+      : "—";
+  }
+  if (syncEl) {
+    syncEl.textContent = settings.lastSync
+      ? new Date(settings.lastSync).toLocaleString()
+      : "Never synced";
+  }
+  if (cloudRevEl) {
+    if (cloud && cloud.revision != null) cloudRevEl.textContent = String(cloud.revision);
+    else if (settings.lastSeenRevision != null) cloudRevEl.textContent = String(settings.lastSeenRevision);
+    else cloudRevEl.textContent = "—";
+  }
   if (!el) return;
   const registered = !!settings.deviceId;
   const pullBit = lastPullAt
@@ -3552,6 +3650,8 @@ if (pollIntervalInput) {
 
 document.getElementById("btn-sync-now").addEventListener("click", () => syncNow());
 document.getElementById("btn-restore").addEventListener("click", () => restoreFromSheet());
+const btnMaster = document.getElementById("btn-sync-master");
+if (btnMaster) btnMaster.addEventListener("click", () => syncNowAsMaster());
 const syncModal = document.getElementById("sync-modal");
 if (syncModal) syncModal.addEventListener("click", (e) => { if (e.target.id === "sync-modal") closeSyncModal(); });
 document.getElementById("btn-export").addEventListener("click", exportJson);
@@ -3709,6 +3809,9 @@ try {
     stripSyntheticPunches,
     deterministicGapPunchId,
     deterministicGapAtIso,
+    cloudHasRicherToday,
+    todayActivityScore,
+    syncNowAsMaster,
     APP_VERSION,
     createList,
     renameList,
@@ -3749,7 +3852,7 @@ function showUpdateBanner() {
   el.id = "app-update-banner";
   el.type = "button";
   el.className = "app-update-banner";
-  el.textContent = "Update available — Tap to reload";
+  el.textContent = "Update available (v" + APP_VERSION + ") — Tap to reload";
   el.addEventListener("click", () => { forceAppUpdateReload(); });
   document.body.insertBefore(el, document.body.firstChild);
 }

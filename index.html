@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="theme-color" content="#1f1f1f" />
   <title>Suraj Pratap's Atomic Habits</title>
-  <link rel="manifest" href="manifest.webmanifest?v=35" />
+  <link rel="manifest" href="manifest.webmanifest?v=36" />
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="icons/icon-192.png" />
-  <link rel="stylesheet" href="styles.css?v=35" />
+  <link rel="stylesheet" href="styles.css?v=36" />
 </head>
 <body>
   <div id="app">
@@ -99,7 +99,12 @@
           <span class="card-icon" aria-hidden="true">☁</span> Google Sheets sync
           <span id="sync-indicator" class="sync-indicator" title="Sync status" aria-label="Sync status">●</span>
         </h2>
-        <p class="muted">Data is saved as <b>Atomic Habits DB</b> in your Drive. Devices <b>auto-sync</b> with the Sheet (source of truth): new devices load the cloud copy, then refresh periodically. <b>Restore</b> pulls the latest Sheet; <b>Upload</b> pushes this device’s changes (blocked if this device is missing today’s check-ins that cloud already has — those are kept via merge). Concurrent edits merge automatically when safe.</p>
+        <p class="muted">Sheet is the source of truth. If phones disagree, use the phone that <b>has today’s entries</b> → <b>Upload</b>, then on the other phone tap <b>Replace with cloud</b>. Auto-sync merges missing today’s punches from cloud (does not wipe them).</p>
+        <div class="sync-rev-panel" id="sync-rev-panel" aria-live="polite">
+          <div><span class="sync-rev-label">This phone rev</span> <strong id="sync-rev-value">—</strong></div>
+          <div><span class="sync-rev-label">Cloud rev</span> <strong id="sync-cloud-rev-value">—</strong></div>
+          <div><span class="sync-rev-label">Last sync</span> <strong id="sync-last-sync">Never synced</strong></div>
+        </div>
         <label class="field-label" for="script-url">Web App URL</label>
         <input type="url" id="script-url" placeholder="https://script.google.com/macros/s/…/exec" value="https://script.google.com/macros/s/AKfycbxxcZhrVNYDpg4ZUfFQNDGudJKUJENaQRRcoyMio8_YEdo5GoKscHAGyUhEd0iK9NkG/exec" />
         <label class="toggle-row">
@@ -117,8 +122,11 @@
           <option value="60000">Every 1 minute</option>
         </select>
         <div class="btn-row">
-          <button class="btn btn-primary" id="btn-sync-now">Upload this device</button>
-          <button class="btn btn-ghost" id="btn-restore">Restore from cloud</button>
+          <button class="btn btn-primary" id="btn-restore">Replace with cloud</button>
+          <button class="btn btn-ghost" id="btn-sync-now">Upload this device</button>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-ghost" id="btn-sync-master" type="button">Use this phone as master</button>
         </div>
         <p class="muted" id="sync-status-text">Never synced.</p>
         <p class="muted" id="sync-safety-text">Device — · last pull — · next refresh in —</p>
@@ -242,6 +250,6 @@
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   </div>
 
-  <script src="app.js?v=35"></script>
+  <script src="app.js?v=36"></script>
 </body>
 </html>
