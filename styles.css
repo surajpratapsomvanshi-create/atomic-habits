@@ -364,6 +364,7 @@ body {
 .sync-indicator.pending { color: var(--amber); }
 .sync-indicator.warn { color: var(--amber); filter: drop-shadow(0 0 4px rgba(253, 214, 99, 0.55)); }
 .sync-indicator.error { color: var(--red); }
+.sync-error-text { color: var(--red); font-weight: 600; }
 
 /* sync conflict modal: allow the action buttons to wrap on small screens */
 .sync-modal-actions { flex-wrap: wrap; gap: 8px; justify-content: flex-end; }

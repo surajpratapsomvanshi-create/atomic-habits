@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "36";
+const APP_VERSION = "37";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -170,6 +170,9 @@ function loadSettings() {
     deviceId: null,            // stable per-device id
     lastSeenRevision: null,    // last cloud revision this device confirmed
     lastSeenUpdatedAt: null,   // timestamp of that revision
+    lastSyncOkAt: null,        // last successful upload or pull
+    lastPullOkAt: null,        // last successful cloud pull
+    lastSyncError: null,       // { at, message } last cloud API failure
   };
   const saved = load(LS_SETTINGS, null);
   const merged = saved ? { ...defaults, ...saved } : { ...defaults };
@@ -2518,6 +2521,116 @@ function deleteHabit() {
 }
 
 /* ---------------- Google Sheets sync (fail-safe) ---------------- */
+
+/** HTTP error from cloud API — surfaced in Settings diagnostics. */
+function GasHttpError(status, snippet) {
+  this.name = "GasHttpError";
+  this.status = status;
+  this.snippet = snippet || "";
+  this.message = "HTTP " + status + (snippet ? " — " + String(snippet).slice(0, 120) : "");
+}
+GasHttpError.prototype = Object.create(Error.prototype);
+
+async function gasJsonGet(url) {
+  const res = await fetch(url, { method: "GET", cache: "no-store" });
+  const text = await res.text();
+  if (!res.ok) throw new GasHttpError(res.status, text);
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    throw new Error("Cloud returned invalid JSON");
+  }
+}
+
+/**
+ * POST via XMLHttpRequest — Google Apps Script redirects POST and fetch()
+ * often turns it into a broken GET (404/411). XHR survives the redirect on mobile.
+ */
+function gasPostJson(url, payload) {
+  const body = JSON.stringify(payload);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.setRequestHeader("Content-Type", "text/plain;charset=utf-8");
+    xhr.timeout = 120000;
+    xhr.onload = () => {
+      const text = xhr.responseText || "";
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try { resolve(JSON.parse(text)); }
+        catch (_) { reject(new Error("Cloud returned invalid JSON on upload")); }
+      } else {
+        reject(new GasHttpError(xhr.status, text));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Network error — can't reach cloud"));
+    xhr.ontimeout = () => reject(new Error("Upload timed out (120s)"));
+    xhr.send(body);
+  });
+}
+
+/** GET ?action=save&payload=base64 fallback when POST transport fails (needs backend v37+). */
+async function gasSaveViaGet(payload) {
+  const json = JSON.stringify(payload);
+  if (json.length > 150000) {
+    throw new Error("Upload too large for GET fallback — redeploy Apps Script backend");
+  }
+  const b64 = btoa(unescape(encodeURIComponent(json)));
+  return gasJsonGet(
+    settings.scriptUrl + "?action=save&payload=" + encodeURIComponent(b64)
+  );
+}
+
+async function gasJsonPost(payload) {
+  try {
+    return await gasPostJson(settings.scriptUrl, payload);
+  } catch (err) {
+    const status = err && err.status;
+    if (status === 404 || status === 405 || status === 411) {
+      return gasSaveViaGet(payload);
+    }
+    throw err;
+  }
+}
+
+function recordSyncSuccess(kind) {
+  const now = new Date().toISOString();
+  settings.lastSyncError = null;
+  if (kind === "pull") settings.lastPullOkAt = now;
+  settings.lastSyncOkAt = now;
+  saveSettings();
+  updateSyncDiagnostics();
+}
+
+function recordSyncError(err, context) {
+  const msg = (context ? context + ": " : "") +
+    (err && err.message ? err.message : String(err));
+  settings.lastSyncError = { at: new Date().toISOString(), message: msg };
+  saveSettings();
+  updateSyncDiagnostics();
+}
+
+function updateSyncDiagnostics() {
+  const okEl = document.getElementById("sync-last-ok");
+  const errEl = document.getElementById("sync-last-error");
+  if (okEl) {
+    okEl.textContent = settings.lastSyncOkAt
+      ? new Date(settings.lastSyncOkAt).toLocaleString()
+      : "—";
+  }
+  if (errEl) {
+    if (settings.lastSyncError && settings.lastSyncError.message) {
+      const when = settings.lastSyncError.at
+        ? new Date(settings.lastSyncError.at).toLocaleString() + " — "
+        : "";
+      errEl.textContent = when + settings.lastSyncError.message;
+      errEl.classList.add("sync-error-text");
+    } else {
+      errEl.textContent = "None";
+      errEl.classList.remove("sync-error-text");
+    }
+  }
+}
+
 function setSyncIndicator(state, text) {
   const el = document.getElementById("sync-indicator");
   if (el) el.className = "sync-indicator " + state;
@@ -2557,8 +2670,7 @@ function pollIntervalMs() {
 
 /** Fetch cloud metadata; falls back to ?action=load for legacy backends. */
 async function fetchCloudInfo() {
-  const res = await fetch(settings.scriptUrl + "?action=info");
-  const out = await res.json();
+  const out = await gasJsonGet(settings.scriptUrl + "?action=info");
   if (out && out.ok && (out.hasData !== undefined || out.revision !== undefined)) {
     return {
       hasData: !!out.hasData,
@@ -2570,8 +2682,7 @@ async function fetchCloudInfo() {
     };
   }
   // Legacy backend: no metadata in info → probe the actual snapshot.
-  const r2 = await fetch(settings.scriptUrl + "?action=load");
-  const o2 = await r2.json();
+  const o2 = await gasJsonGet(settings.scriptUrl + "?action=load");
   const hasData = !!(o2 && o2.ok && o2.data && Array.isArray(o2.data.habits) && o2.data.habits.length > 0);
   return {
     hasData,
@@ -2964,8 +3075,7 @@ function dedupeHabitsByName(payload) {
 
 /** Load full cloud snapshot (for merge / conflict resolve). */
 async function fetchCloudSnapshot() {
-  const res = await fetch(settings.scriptUrl + "?action=load");
-  const out = await res.json();
+  const out = await gasJsonGet(settings.scriptUrl + "?action=load");
   if (!out || !out.ok || !out.data) return null;
   return out;
 }
@@ -3074,7 +3184,8 @@ async function initSync() {
     // Can't confirm cloud state → stay disarmed so we never overwrite blindly.
     autoSyncArmed = false;
     cloudChecked = true;
-    setSyncIndicator("error", "Cloud check failed — auto-sync paused. Tap Restore or Upload.");
+    recordSyncError(err, "Startup");
+    setSyncIndicator("error", "Cloud check failed — " + err.message);
     updateSyncSafetyText(null);
     return;
   }
@@ -3154,17 +3265,12 @@ async function pushSnapshot(opts) {
       }
     } catch (_) { /* proceed with last known base */ }
   }
-  const res = await fetch(settings.scriptUrl, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify({
-      action: "save",
-      data,
-      baseRevision: settings.lastSeenRevision,
-      deviceId: settings.deviceId,
-    }),
+  const out = await gasJsonPost({
+    action: "save",
+    data,
+    baseRevision: settings.lastSeenRevision,
+    deviceId: settings.deviceId,
   });
-  const out = await res.json();
   if (out && out.conflict) {
     updateSyncSafetyText(out);
     if (opts.force) {
@@ -3173,23 +3279,19 @@ async function pushSnapshot(opts) {
         settings.lastSeenRevision = out.revision;
         settings.lastSeenUpdatedAt = out.updatedAt || new Date().toISOString();
         saveSettings();
-        const res2 = await fetch(settings.scriptUrl, {
-          method: "POST",
-          headers: { "Content-Type": "text/plain;charset=utf-8" },
-          body: JSON.stringify({
-            action: "save",
-            data,
-            baseRevision: settings.lastSeenRevision,
-            deviceId: settings.deviceId,
-          }),
+        const out2 = await gasJsonPost({
+          action: "save",
+          data,
+          baseRevision: settings.lastSeenRevision,
+          deviceId: settings.deviceId,
         });
-        const out2 = await res2.json();
         if (out2 && out2.ok) {
           settings.lastSync = new Date().toISOString();
           rememberRevision(out2);
           saveSettings();
           autoSyncArmed = true;
           localDirty = false;
+          recordSyncSuccess("push");
           updateSyncSafetyText(out2);
           return true;
         }
@@ -3206,6 +3308,7 @@ async function pushSnapshot(opts) {
   saveSettings();
   autoSyncArmed = true;
   localDirty = false;
+  recordSyncSuccess("push");
   updateSyncSafetyText(out);
   return true;
 }
@@ -3274,6 +3377,7 @@ async function syncNow(opts) {
     setSyncIndicator("ok", "Uploaded: " + new Date(settings.lastSync).toLocaleString() + rev);
     if (!opts.silent) toast(settings.lastSeenRevision != null ? "Uploaded to cloud ✓" : "Synced ✓ (legacy backend)");
   } catch (err) {
+    recordSyncError(err, "Upload");
     setSyncIndicator("error", "Upload failed: " + err.message);
     if (!opts.silent) toast("Upload failed — data is safe locally");
   }
@@ -3310,8 +3414,7 @@ async function restoreFromSheet(opts) {
   if (!opts.skipConfirm && !confirm("Replace this phone with cloud data?\n\nA local backup will be saved first, then this phone’s habits and today’s check-ins are replaced with the Google Sheet copy. Use this on the phone that is missing today’s entries.")) return false;
   setSyncIndicator("pending", opts.auto ? "Syncing…" : (opts.fromPoll ? "Refreshing…" : "Restoring…"));
   try {
-    const res = await fetch(settings.scriptUrl + "?action=load");
-    const out = await res.json();
+    const out = await gasJsonGet(settings.scriptUrl + "?action=load");
     if (!out.ok) throw new Error(out.error || "Unknown error");
     if (out.data && Array.isArray(out.data.habits)) {
       const backedUp = makeLocalBackup();
@@ -3327,6 +3430,7 @@ async function restoreFromSheet(opts) {
       localDirty = healed;
       healPendingUpload = healed;
       lastPullAt = Date.now();
+      recordSyncSuccess("pull");
       render();
       updateSyncSafetyText(out);
       if (healed) queueHealUpload();
@@ -3340,6 +3444,7 @@ async function restoreFromSheet(opts) {
     }
     throw new Error("Sheet has no saved data yet");
   } catch (err) {
+    recordSyncError(err, opts.fromPoll ? "Poll pull" : "Restore");
     setSyncIndicator("error", "Restore failed: " + err.message);
     if (!opts.fromPoll) toast("Restore failed: " + err.message);
     return false;
@@ -3393,6 +3498,8 @@ async function pollCloud(opts) {
   try {
     cloud = await fetchCloudInfo();
   } catch (err) {
+    recordSyncError(err, "Poll");
+    setSyncIndicator("error", "Cloud unreachable — " + err.message);
     scheduleNextPoll();
     return;
   }
@@ -3485,6 +3592,7 @@ function updateSyncSafetyText(cloud) {
     else if (settings.lastSeenRevision != null) cloudRevEl.textContent = String(settings.lastSeenRevision);
     else cloudRevEl.textContent = "—";
   }
+  updateSyncDiagnostics();
   if (!el) return;
   const registered = !!settings.deviceId;
   const pullBit = lastPullAt
@@ -3812,6 +3920,8 @@ try {
     cloudHasRicherToday,
     todayActivityScore,
     syncNowAsMaster,
+    gasJsonPost,
+    gasPostJson,
     APP_VERSION,
     createList,
     renameList,

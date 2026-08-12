@@ -169,6 +169,12 @@ function doGet(e) {
         deviceId: meta.deviceId,
       });
     }
+    /** GET fallback when POST upload fails (mobile GAS redirect). payload = base64(JSON body). */
+    if (e.parameter.action === "save" && e.parameter.payload) {
+      const decoded = Utilities.newBlob(Utilities.base64Decode(e.parameter.payload)).getDataAsString();
+      const body = JSON.parse(decoded);
+      return handleSave(body);
+    }
     if (e.parameter.action === "history") {
       const ss = getSpreadsheet();
       const h = ss.getSheetByName(HISTORY_SHEET);
