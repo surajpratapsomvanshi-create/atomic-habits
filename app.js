@@ -2680,6 +2680,19 @@ async function enrichUploadError(postErr, getErr) {
   return new Error(humanizeUploadError(primary) + " [" + detail + "]" + backendHint);
 }
 
+/** Reject non-save JSON (e.g. old backend ignoring saveChunk). */
+function assertSaveTransportResult(out, via) {
+  if (!out) throw new Error("Empty save result via " + via);
+  if (out.waiting) return out;
+  if (out.conflict) return out;
+  if (out.ok && out.revision != null) return out;
+  if (out.ok === false && out.error) throw new Error(out.error);
+  throw new Error(
+    "Save via " + via + " incomplete — redeploy Apps Script backend v39+ (" +
+    String(out.message || out.error || "no revision").slice(0, 100) + ")"
+  );
+}
+
 /** Chunked GET ?action=saveChunk when a single payload URL is too long. */
 async function gasSaveViaChunks(b64) {
   const n = Math.ceil(b64.length / GET_SAVE_CHUNK_CHARS) || 1;
@@ -2694,17 +2707,14 @@ async function gasSaveViaChunks(b64) {
     if (url.length > MAX_GET_SAVE_URL) {
       throw new GasHttpError(414, "Chunk URL still too long (" + url.length + ")");
     }
-    last = await gasJsonGet(url);
-    if (last && last.ok === false && !last.conflict && !last.waiting) {
-      throw new Error(last.error || "Chunked save failed");
-    }
+    last = assertSaveTransportResult(await gasJsonGet(url), "saveChunk");
     if (last && !last.waiting) return last;
   }
   if (!last) throw new Error("Chunked save produced no response");
   if (last.waiting) {
     throw new Error("Chunked save incomplete — missing chunks (try again)");
   }
-  return last;
+  return assertSaveTransportResult(last, "saveChunk");
 }
 
 /** GET ?action=save&payload=base64, or chunked save when URL would be too long. */
@@ -2713,7 +2723,7 @@ async function gasSaveViaGet(payload) {
   const b64 = utf8ToBase64(json);
   const url = settings.scriptUrl + "?action=save&payload=" + encodeURIComponent(b64);
   if (url.length <= MAX_GET_SAVE_URL) {
-    return gasJsonGet(url);
+    return assertSaveTransportResult(await gasJsonGet(url), "GET save");
   }
   return gasSaveViaChunks(b64);
 }
@@ -2725,12 +2735,12 @@ async function gasSaveViaGet(payload) {
 async function gasJsonPost(payload) {
   let postErr = null;
   try {
-    return await gasPostJson(settings.scriptUrl, payload);
+    return assertSaveTransportResult(await gasPostJson(settings.scriptUrl, payload), "POST");
   } catch (err) {
     postErr = err;
   }
   try {
-    return await gasPostForm(settings.scriptUrl, payload);
+    return assertSaveTransportResult(await gasPostForm(settings.scriptUrl, payload), "form POST");
   } catch (formErr) {
     if (!postErr) postErr = formErr;
     else {
