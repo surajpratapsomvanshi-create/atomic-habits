@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "37";
+const APP_VERSION = "38";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -2556,6 +2556,10 @@ function gasPostJson(url, payload) {
     xhr.onload = () => {
       const text = xhr.responseText || "";
       if (xhr.status >= 200 && xhr.status < 300) {
+        if (!String(text).trim()) {
+          reject(new Error("Empty response on upload"));
+          return;
+        }
         try { resolve(JSON.parse(text)); }
         catch (_) { reject(new Error("Cloud returned invalid JSON on upload")); }
       } else {
@@ -2568,6 +2572,68 @@ function gasPostJson(url, payload) {
   });
 }
 
+/** True when mobile/GAS transport often needs the GET ?action=save fallback. */
+function shouldTryGetSaveFallback(err) {
+  if (!err) return true;
+  const status = err.status;
+  if (status === 0 || status === 404 || status === 405 || status === 411 || status === 502 || status === 503) {
+    return true;
+  }
+  const msg = String(err.message || "");
+  return /Network error|invalid JSON|Empty response|timed out|Failed to fetch|Load failed/i.test(msg);
+}
+
+/** Turn raw transport errors into Settings-friendly actions. */
+function humanizeUploadError(err) {
+  const status = err && err.status;
+  const msg = err && err.message ? String(err.message) : String(err || "Unknown error");
+  if (status === 401 || status === 403) {
+    return "Backend auth blocked — redeploy Apps Script (Who has access: Anyone)";
+  }
+  if (status === 414 || /too large|URI Too Long/i.test(msg)) {
+    return "Upload too large for GET fallback — data is safe locally; try Wi‑Fi or master upload again";
+  }
+  if (status === 404 || status === 405 || status === 411) {
+    return "Upload blocked by Apps Script redirect (HTTP " + status + ") — needs backend v37+ GET save";
+  }
+  if (/invalid JSON|Empty response/i.test(msg)) {
+    return "Cloud returned a bad upload response (redirect/HTML) — retry; if it persists redeploy backend";
+  }
+  if (/Network error|Failed to fetch|Load failed/i.test(msg)) {
+    return "Network error on upload — check connection; Settings → Last error for details";
+  }
+  if (/timed out/i.test(msg)) {
+    return "Upload timed out — try again on Wi‑Fi";
+  }
+  return msg;
+}
+
+/** Remember backend capabilities from ?action=info for diagnostics. */
+function rememberBackendInfo(info) {
+  if (!info || typeof info !== "object") return;
+  if (info.backendVersion != null) settings.backendVersion = info.backendVersion;
+  if (info.supportsGetSave != null) settings.supportsGetSave = !!info.supportsGetSave;
+}
+
+async function enrichUploadError(postErr, getErr) {
+  let backendHint = "";
+  try {
+    const info = await gasJsonGet(settings.scriptUrl + "?action=info");
+    rememberBackendInfo(info);
+    saveSettings();
+    const ver = info && info.backendVersion != null ? Number(info.backendVersion) : null;
+    if (ver != null && (ver < 37 || info.supportsGetSave === false)) {
+      backendHint = " Backend needs redeploy (v37+ with GET save).";
+    } else if (ver != null) {
+      backendHint = " Backend v" + ver + " OK — retry Upload, or tap Replace with cloud on the other phone.";
+    }
+  } catch (_) {
+    backendHint = " Could not reach backend info — check Web App URL / network.";
+  }
+  const primary = getErr || postErr;
+  return new Error(humanizeUploadError(primary) + backendHint);
+}
+
 /** GET ?action=save&payload=base64 fallback when POST transport fails (needs backend v37+). */
 async function gasSaveViaGet(payload) {
   const json = JSON.stringify(payload);
@@ -2575,20 +2641,23 @@ async function gasSaveViaGet(payload) {
     throw new Error("Upload too large for GET fallback — redeploy Apps Script backend");
   }
   const b64 = btoa(unescape(encodeURIComponent(json)));
-  return gasJsonGet(
-    settings.scriptUrl + "?action=save&payload=" + encodeURIComponent(b64)
-  );
+  const url = settings.scriptUrl + "?action=save&payload=" + encodeURIComponent(b64);
+  if (url.length > 180000) {
+    throw new Error("Upload too large for GET fallback (URL length)");
+  }
+  return gasJsonGet(url);
 }
 
 async function gasJsonPost(payload) {
   try {
     return await gasPostJson(settings.scriptUrl, payload);
   } catch (err) {
-    const status = err && err.status;
-    if (status === 404 || status === 405 || status === 411) {
-      return gasSaveViaGet(payload);
+    if (!shouldTryGetSaveFallback(err)) throw err;
+    try {
+      return await gasSaveViaGet(payload);
+    } catch (getErr) {
+      throw await enrichUploadError(err, getErr);
     }
-    throw err;
   }
 }
 
@@ -2671,25 +2740,33 @@ function pollIntervalMs() {
 /** Fetch cloud metadata; falls back to ?action=load for legacy backends. */
 async function fetchCloudInfo() {
   const out = await gasJsonGet(settings.scriptUrl + "?action=info");
+  rememberBackendInfo(out);
   if (out && out.ok && (out.hasData !== undefined || out.revision !== undefined)) {
+    saveSettings();
     return {
       hasData: !!out.hasData,
       revision: out.revision != null ? out.revision : null,
       updatedAt: out.updatedAt || null,
       deviceId: out.deviceId || null,
       spreadsheetUrl: out.spreadsheetUrl || null,
+      backendVersion: out.backendVersion != null ? out.backendVersion : null,
+      supportsGetSave: !!out.supportsGetSave,
       legacy: false,
     };
   }
   // Legacy backend: no metadata in info → probe the actual snapshot.
   const o2 = await gasJsonGet(settings.scriptUrl + "?action=load");
   const hasData = !!(o2 && o2.ok && o2.data && Array.isArray(o2.data.habits) && o2.data.habits.length > 0);
+  settings.supportsGetSave = false;
+  saveSettings();
   return {
     hasData,
     revision: o2 && o2.revision != null ? o2.revision : null,
     updatedAt: (o2 && o2.updatedAt) || null,
     deviceId: (o2 && o2.deviceId) || null,
     spreadsheetUrl: (out && out.spreadsheetUrl) || null,
+    backendVersion: null,
+    supportsGetSave: false,
     legacy: !(o2 && o2.revision !== undefined),
   };
 }
@@ -2737,6 +2814,17 @@ function cloudHasRicherToday(localData, cloudData) {
   const local = todayActivityScore(localData);
   const cloud = todayActivityScore(cloudData);
   if (cloud.score <= 0 && cloud.punches <= 0 && cloud.checks <= 0) return false;
+  // Local clearly ahead or tied on every habit → safe to upload (don't block master phone).
+  if (local.score >= cloud.score && local.punches >= cloud.punches && local.checks >= cloud.checks) {
+    let localCoversCloudHabits = true;
+    for (const id of Object.keys(cloud.byHabit || {})) {
+      if ((local.byHabit[id] || 0) < (cloud.byHabit[id] || 0)) {
+        localCoversCloudHabits = false;
+        break;
+      }
+    }
+    if (localCoversCloudHabits) return false;
+  }
   if (cloud.punches > local.punches) return true;
   if (cloud.checks > local.checks) return true;
   // Any habit where cloud has more real + punches today than local.
@@ -2747,15 +2835,17 @@ function cloudHasRicherToday(localData, cloudData) {
   for (const id of ids) {
     if ((cloud.byHabit[id] || 0) > (local.byHabit[id] || 0)) return true;
   }
-  // Cloud has punch ids for today that local lacks.
-  const day = todayStr();
-  const localIds = new Set(
-    stripSyntheticPunches((localData && localData.punches) || [])
-      .filter(p => punchDay(p) === day)
-      .map(p => String(p.id))
-  );
-  for (const p of stripSyntheticPunches((cloudData && cloudData.punches) || [])) {
-    if (punchDay(p) === day && p && p.id && !localIds.has(String(p.id))) return true;
+  // Cloud has punch ids for today that local lacks — only when cloud is ahead overall.
+  if (cloud.score > local.score || cloud.punches > local.punches) {
+    const day = todayStr();
+    const localIds = new Set(
+      stripSyntheticPunches((localData && localData.punches) || [])
+        .filter(p => punchDay(p) === day)
+        .map(p => String(p.id))
+    );
+    for (const p of stripSyntheticPunches((cloudData && cloudData.punches) || [])) {
+      if (punchDay(p) === day && p && p.id && !localIds.has(String(p.id))) return true;
+    }
   }
   return cloud.score > local.score;
 }
@@ -3151,21 +3241,32 @@ async function resolveConflictAuto(cloudOrOut, opts) {
   saveSettings();
   render();
 
-  const pushed = await pushSnapshot({ silent: true, afterMerge: true });
+  let pushed = false;
+  try {
+    pushed = await pushSnapshot({ silent: true, afterMerge: true });
+  } catch (err) {
+    // Keep merged local data — never wipe the correct phone after a transport failure.
+    localDirty = true;
+    autoSyncArmed = true;
+    recordSyncError(err, "Merge upload");
+    const msg = humanizeUploadError(err);
+    setSyncIndicator("error", "Merged locally — upload failed: " + msg);
+    if (!opts.silent) toast("Merged on this phone — upload failed (see Settings → Last error)");
+    return false;
+  }
   if (pushed) {
     setSyncIndicator("ok", "Merged with cloud · rev " + (settings.lastSeenRevision != null ? settings.lastSeenRevision : "?"));
     if (!opts.silent) toast("Synced — merged with cloud");
     return true;
   }
 
-  // Concurrent edit during merge push → take cloud (never force).
-  rememberRevision(cloudMeta);
-  saveSettings();
-  await restoreFromSheet({
-    skipConfirm: true,
-    fromPoll: true,
-    toastMsg: "Loaded cloud version",
-  });
+  // Concurrent edit during merge push → keep merge locally and ask for retry (don't clobber).
+  localDirty = true;
+  autoSyncArmed = true;
+  const conflictMsg = "Cloud changed during merge — tap Upload again (data kept on this phone)";
+  recordSyncError(new Error(conflictMsg), "Merge upload");
+  setSyncIndicator("error", conflictMsg);
+  if (!opts.silent) toast(conflictMsg);
   return false;
 }
 
@@ -3251,7 +3352,7 @@ function queueSync() {
 /**
  * POST current `data` with baseRevision. Returns true on success.
  * On conflict, optionally auto-resolves (merge/pull) unless opts.skipResolve.
- * opts.force → adopt current cloud revision as base so this device overwrites.
+ * opts.force → master overwrite (backend force + adopt revision).
  */
 async function pushSnapshot(opts) {
   opts = opts || {};
@@ -3270,11 +3371,12 @@ async function pushSnapshot(opts) {
     data,
     baseRevision: settings.lastSeenRevision,
     deviceId: settings.deviceId,
+    force: !!opts.force,
   });
   if (out && out.conflict) {
     updateSyncSafetyText(out);
     if (opts.force) {
-      // Retry once adopting the conflict revision as base.
+      // Backend should accept force; if an old backend ignored it, retry with matching base.
       if (out.revision != null) {
         settings.lastSeenRevision = out.revision;
         settings.lastSeenUpdatedAt = out.updatedAt || new Date().toISOString();
@@ -3284,6 +3386,7 @@ async function pushSnapshot(opts) {
           data,
           baseRevision: settings.lastSeenRevision,
           deviceId: settings.deviceId,
+          force: true,
         });
         if (out2 && out2.ok) {
           settings.lastSync = new Date().toISOString();
@@ -3295,8 +3398,12 @@ async function pushSnapshot(opts) {
           updateSyncSafetyText(out2);
           return true;
         }
+        if (out2 && out2.conflict) {
+          throw new Error("Cloud has newer data — tap Replace with cloud on the other phone, or retry master upload");
+        }
+        throw new Error((out2 && out2.error) || "Master upload failed");
       }
-      return false;
+      throw new Error("Master upload failed — cloud conflict with no revision");
     }
     if (opts.skipResolve || opts.afterMerge) return false;
     await resolveConflictAuto(out, { silent: opts.silent });
@@ -3363,8 +3470,9 @@ async function syncNow(opts) {
     try {
       if (await guardUploadAgainstLosingToday(opts)) return;
     } catch (err) {
-      setSyncIndicator("error", "Upload blocked: " + (err && err.message ? err.message : "sync guard failed"));
-      if (!opts.silent) toast("Upload blocked — cloud may have today's check-ins");
+      setSyncIndicator("error", "Upload blocked: " + humanizeUploadError(err));
+      if (!opts.silent) toast("Upload blocked — see Settings → Last error");
+      recordSyncError(err, "Upload guard");
       return;
     }
   }
@@ -3372,14 +3480,28 @@ async function syncNow(opts) {
   setSyncIndicator("pending", opts.force ? "Uploading as master…" : (opts.silent ? "Syncing…" : "Uploading…"));
   try {
     const ok = await pushSnapshot({ silent: opts.silent, force: !!opts.force });
-    if (!ok) return;
+    if (!ok) {
+      // resolveConflictAuto / merge path may already have set Last error + toast.
+      if (settings.lastSyncError && settings.lastSyncError.message) {
+        setSyncIndicator("error", settings.lastSyncError.message.replace(/^Upload:\s*/i, "").replace(/^Merge upload:\s*/i, ""));
+        return;
+      }
+      const msg = opts.force
+        ? "Master upload did not finish — try again"
+        : "Cloud has newer data — tap Replace with cloud (or Upload again to merge)";
+      recordSyncError(new Error(msg), "Upload");
+      setSyncIndicator("error", msg);
+      if (!opts.silent) toast(msg);
+      return;
+    }
     const rev = settings.lastSeenRevision != null ? " · rev " + settings.lastSeenRevision : "";
     setSyncIndicator("ok", "Uploaded: " + new Date(settings.lastSync).toLocaleString() + rev);
     if (!opts.silent) toast(settings.lastSeenRevision != null ? "Uploaded to cloud ✓" : "Synced ✓ (legacy backend)");
   } catch (err) {
     recordSyncError(err, "Upload");
-    setSyncIndicator("error", "Upload failed: " + err.message);
-    if (!opts.silent) toast("Upload failed — data is safe locally");
+    const nice = humanizeUploadError(err);
+    setSyncIndicator("error", "Upload failed: " + nice);
+    if (!opts.silent) toast("Upload failed — see Settings → Last error");
   }
 }
 
@@ -3608,6 +3730,9 @@ function updateSyncSafetyText(cloud) {
     if (cloud.legacy) parts.push("legacy backend");
     else if (cloud.hasData || cloud.revision != null) parts.push("cloud rev " + (cloud.revision != null ? cloud.revision : "?"));
     else parts.push("cloud empty");
+    if (cloud.backendVersion != null) parts.push("backend v" + cloud.backendVersion);
+  } else if (settings.backendVersion != null) {
+    parts.push("backend v" + settings.backendVersion);
   }
   el.textContent = parts.join(" · ");
 }

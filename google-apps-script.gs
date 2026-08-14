@@ -38,22 +38,76 @@ const LOG_SHEET = "Log";
 const BACKUP_SHEET = "_backup";
 const HISTORY_SHEET = "_history";
 const MAX_HISTORY = 20;
+/** Bump when redeploying; v37+ adds GET ?action=save base64 fallback for mobile. */
+const BACKEND_VERSION = 37;
 
 /* ---------------- HTTP entry points ---------------- */
 
-function doPost(e) {
-  const lock = LockService.getScriptLock();
-  lock.tryLock(20000);
+function getParams(e) {
+  return (e && e.parameter) ? e.parameter : {};
+}
+
+/** Decode ?payload= base64(JSON) from GET save fallback (handles + → space in URLs). */
+function decodePayloadParam(payload) {
+  var raw = String(payload || "").replace(/ /g, "+");
+  var pad = raw.length % 4;
+  if (pad) raw += "====".slice(pad);
+  var decoded = Utilities.newBlob(Utilities.base64Decode(raw)).getDataAsString();
+  return JSON.parse(decoded);
+}
+
+/** Parse POST body — text/plain JSON, or ?payload= after a redirect. */
+function parseRequestBody(e) {
+  if (!e) return null;
+  if (e.postData && e.postData.contents) {
+    var text = String(e.postData.contents);
+    if (text) return JSON.parse(text);
+  }
+  var p = getParams(e);
+  if (p.payload) return decodePayloadParam(p.payload);
+  if (p.action) {
+    return {
+      action: p.action,
+      data: p.data ? safeParse(p.data) : undefined,
+      baseRevision: p.baseRevision != null && p.baseRevision !== ""
+        ? Number(p.baseRevision) : undefined,
+      deviceId: p.deviceId || null,
+      force: p.force === "true" || p.force === true,
+      revision: p.revision,
+    };
+  }
+  return null;
+}
+
+function withLock(fn) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) {
+    return json({ ok: false, error: "Server busy — try again in a few seconds" });
+  }
   try {
-    const body = JSON.parse(e.postData.contents);
-    if (body.action === "save") return handleSave(body);
-    if (body.action === "restoreRevision") return handleRestoreRevision(body);
-    return json({ ok: false, error: "Unknown action" });
-  } catch (err) {
-    return json({ ok: false, error: String(err) });
+    return fn();
   } finally {
     lock.releaseLock();
   }
+}
+
+function dispatchAction(body) {
+  if (!body || !body.action) return json({ ok: false, error: "Missing action" });
+  if (body.action === "save") return handleSave(body);
+  if (body.action === "restoreRevision") return handleRestoreRevision(body);
+  return json({ ok: false, error: "Unknown action: " + body.action });
+}
+
+function doPost(e) {
+  return withLock(function () {
+    try {
+      var body = parseRequestBody(e);
+      if (!body) return json({ ok: false, error: "Empty request body" });
+      return dispatchAction(body);
+    } catch (err) {
+      return json({ ok: false, error: "Bad request: " + String(err) });
+    }
+  });
 }
 
 /**
@@ -142,46 +196,65 @@ function handleRestoreRevision(body) {
 
 function doGet(e) {
   try {
-    if (e.parameter.action === "load") {
-      const ss = getSpreadsheet();
-      const backup = ss.getSheetByName(BACKUP_SHEET);
-      const raw = backup.getRange(1, 1).getValue();
-      if (!raw) return json({ ok: false, error: "No data saved yet", hasData: false, revision: 0 });
-      const meta = readMeta(backup);
+    var p = getParams(e);
+    var action = p.action;
+
+    /** GET fallback when POST upload fails (mobile GAS redirect → 404/411). */
+    if (action === "save" && p.payload) {
+      return withLock(function () {
+        try {
+          var body = decodePayloadParam(p.payload);
+          return dispatchAction(body);
+        } catch (err) {
+          return json({ ok: false, error: "Bad save payload: " + String(err) });
+        }
+      });
+    }
+
+    if (action === "load") {
+      var ss = getSpreadsheet();
+      ensureTabs(ss);
+      var backup = ss.getSheetByName(BACKUP_SHEET);
+      var raw = backup.getRange(1, 1).getValue();
+      if (!raw) {
+        return json({ ok: false, error: "No data saved yet", hasData: false, revision: 0 });
+      }
+      var parsed = safeParse(raw);
+      if (!parsed) return json({ ok: false, error: "Snapshot unreadable", hasData: false });
+      var meta = readMeta(backup);
       return json({
-        ok: true, data: JSON.parse(raw),
+        ok: true, data: parsed,
         revision: meta.revision, updatedAt: meta.updatedAt, deviceId: meta.deviceId,
       });
     }
-    if (e.parameter.action === "info") {
-      const ss = getSpreadsheet();
-      const backup = ss.getSheetByName(BACKUP_SHEET);
-      const raw = backup.getRange(1, 1).getValue();
-      const meta = readMeta(backup);
+
+    if (action === "info") {
+      var ssInfo = getSpreadsheet();
+      ensureTabs(ssInfo);
+      var backupInfo = ssInfo.getSheetByName(BACKUP_SHEET);
+      var rawInfo = backupInfo.getRange(1, 1).getValue();
+      var metaInfo = readMeta(backupInfo);
       return json({
         ok: true,
-        name: ss.getName(),
-        spreadsheetUrl: ss.getUrl(),
+        name: ssInfo.getName(),
+        spreadsheetUrl: ssInfo.getUrl(),
         folderId: FOLDER_ID,
-        hasData: dataHasContent(safeParse(raw)),
-        revision: meta.revision,
-        updatedAt: meta.updatedAt,
-        deviceId: meta.deviceId,
+        hasData: dataHasContent(safeParse(rawInfo)),
+        revision: metaInfo.revision,
+        updatedAt: metaInfo.updatedAt,
+        deviceId: metaInfo.deviceId,
+        backendVersion: BACKEND_VERSION,
+        supportsGetSave: true,
       });
     }
-    /** GET fallback when POST upload fails (mobile GAS redirect). payload = base64(JSON body). */
-    if (e.parameter.action === "save" && e.parameter.payload) {
-      const decoded = Utilities.newBlob(Utilities.base64Decode(e.parameter.payload)).getDataAsString();
-      const body = JSON.parse(decoded);
-      return handleSave(body);
-    }
-    if (e.parameter.action === "history") {
-      const ss = getSpreadsheet();
-      const h = ss.getSheetByName(HISTORY_SHEET);
-      const out = [];
+
+    if (action === "history") {
+      var ssHist = getSpreadsheet();
+      var h = ssHist.getSheetByName(HISTORY_SHEET);
+      var out = [];
       if (h) {
-        const last = h.getLastRow();
-        for (let r = 2; r <= last; r++) {
+        var last = h.getLastRow();
+        for (var r = 2; r <= last; r++) {
           out.push({
             timestamp: h.getRange(r, 1).getValue(),
             revision: h.getRange(r, 2).getValue(),
@@ -191,12 +264,15 @@ function doGet(e) {
       }
       return json({ ok: true, history: out });
     }
+
     // Visiting the URL in a browser also ensures the DB exists
-    const ss = getSpreadsheet();
+    var ssDefault = getSpreadsheet();
     return json({
       ok: true,
       message: "Atomic Habits backend is running",
-      spreadsheetUrl: ss.getUrl(),
+      backendVersion: BACKEND_VERSION,
+      supportsGetSave: true,
+      spreadsheetUrl: ssDefault.getUrl(),
     });
   } catch (err) {
     return json({ ok: false, error: String(err) });
