@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "38";
+const APP_VERSION = "39";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -2527,18 +2527,24 @@ function GasHttpError(status, snippet) {
   this.name = "GasHttpError";
   this.status = status;
   this.snippet = snippet || "";
-  this.message = "HTTP " + status + (snippet ? " — " + String(snippet).slice(0, 120) : "");
+  this.message = "HTTP " + status + (snippet ? " — " + String(snippet).slice(0, 160) : "");
 }
 GasHttpError.prototype = Object.create(Error.prototype);
+
+/** Safe base64 of UTF-8 JSON for GET/form fallbacks. */
+function utf8ToBase64(str) {
+  return btoa(unescape(encodeURIComponent(str)));
+}
 
 async function gasJsonGet(url) {
   const res = await fetch(url, { method: "GET", cache: "no-store" });
   const text = await res.text();
   if (!res.ok) throw new GasHttpError(res.status, text);
+  if (!String(text).trim()) throw new Error("Empty response from cloud");
   try {
     return JSON.parse(text);
   } catch (_) {
-    throw new Error("Cloud returned invalid JSON");
+    throw new GasHttpError(res.status || 200, "invalid JSON: " + String(text).slice(0, 120));
   }
 }
 
@@ -2561,27 +2567,51 @@ function gasPostJson(url, payload) {
           return;
         }
         try { resolve(JSON.parse(text)); }
-        catch (_) { reject(new Error("Cloud returned invalid JSON on upload")); }
+        catch (_) { reject(new GasHttpError(xhr.status, "invalid JSON: " + String(text).slice(0, 120))); }
       } else {
         reject(new GasHttpError(xhr.status, text));
       }
     };
-    xhr.onerror = () => reject(new Error("Network error — can't reach cloud"));
+    xhr.onerror = () => reject(new GasHttpError(0, "Network error — can't reach cloud (XHR POST)"));
     xhr.ontimeout = () => reject(new Error("Upload timed out (120s)"));
     xhr.send(body);
   });
 }
 
-/** True when mobile/GAS transport often needs the GET ?action=save fallback. */
-function shouldTryGetSaveFallback(err) {
-  if (!err) return true;
-  const status = err.status;
-  if (status === 0 || status === 404 || status === 405 || status === 411 || status === 502 || status === 503) {
-    return true;
-  }
-  const msg = String(err.message || "");
-  return /Network error|invalid JSON|Empty response|timed out|Failed to fetch|Load failed/i.test(msg);
+/**
+ * Form-urlencoded POST with payload=base64(JSON). Works when text/plain POST
+ * is stripped by a redirect but a form body still reaches Apps Script.
+ */
+function gasPostForm(url, payload) {
+  const b64 = utf8ToBase64(JSON.stringify(payload));
+  const body = "payload=" + encodeURIComponent(b64);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url, true);
+    xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded;charset=utf-8");
+    xhr.timeout = 120000;
+    xhr.onload = () => {
+      const text = xhr.responseText || "";
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (!String(text).trim()) {
+          reject(new Error("Empty response on form upload"));
+          return;
+        }
+        try { resolve(JSON.parse(text)); }
+        catch (_) { reject(new GasHttpError(xhr.status, "invalid JSON: " + String(text).slice(0, 120))); }
+      } else {
+        reject(new GasHttpError(xhr.status, text));
+      }
+    };
+    xhr.onerror = () => reject(new GasHttpError(0, "Network error — can't reach cloud (form POST)"));
+    xhr.ontimeout = () => reject(new Error("Form upload timed out (120s)"));
+    xhr.send(body);
+  });
 }
+
+/** Keep GET URLs under typical mobile / Apps Script query limits. */
+const MAX_GET_SAVE_URL = 7000;
+const GET_SAVE_CHUNK_CHARS = 1200;
 
 /** Turn raw transport errors into Settings-friendly actions. */
 function humanizeUploadError(err) {
@@ -2590,16 +2620,16 @@ function humanizeUploadError(err) {
   if (status === 401 || status === 403) {
     return "Backend auth blocked — redeploy Apps Script (Who has access: Anyone)";
   }
-  if (status === 414 || /too large|URI Too Long/i.test(msg)) {
-    return "Upload too large for GET fallback — data is safe locally; try Wi‑Fi or master upload again";
+  if (status === 414 || /too large|URI Too Long|Chunk URL/i.test(msg)) {
+    return "Upload too large for GET fallback — needs backend v39+ chunked save (redeploy Apps Script)";
   }
   if (status === 404 || status === 405 || status === 411) {
-    return "Upload blocked by Apps Script redirect (HTTP " + status + ") — needs backend v37+ GET save";
+    return "Upload blocked by Apps Script redirect (HTTP " + status + ") — retry; redeploy backend if it persists";
   }
   if (/invalid JSON|Empty response/i.test(msg)) {
     return "Cloud returned a bad upload response (redirect/HTML) — retry; if it persists redeploy backend";
   }
-  if (/Network error|Failed to fetch|Load failed/i.test(msg)) {
+  if (/Network error|Failed to fetch|Load failed|status\":\s*0|HTTP 0/i.test(msg)) {
     return "Network error on upload — check connection; Settings → Last error for details";
   }
   if (/timed out/i.test(msg)) {
@@ -2608,11 +2638,26 @@ function humanizeUploadError(err) {
   return msg;
 }
 
+/** Compact detail string for Settings → Last error (status + truncated body). */
+function formatSyncErrorDetail(err) {
+  const bits = [];
+  if (err && err.status != null) bits.push("HTTP " + err.status);
+  const msg = err && err.message ? String(err.message) : String(err || "Unknown error");
+  bits.push(msg);
+  if (err && err.snippet) {
+    const snip = String(err.snippet).replace(/\s+/g, " ").trim().slice(0, 160);
+    if (snip && msg.indexOf(snip) < 0) bits.push(snip);
+  }
+  return bits.join(" | ").slice(0, 500);
+}
+
 /** Remember backend capabilities from ?action=info for diagnostics. */
 function rememberBackendInfo(info) {
   if (!info || typeof info !== "object") return;
   if (info.backendVersion != null) settings.backendVersion = info.backendVersion;
   if (info.supportsGetSave != null) settings.supportsGetSave = !!info.supportsGetSave;
+  if (info.supportsChunkedSave != null) settings.supportsChunkedSave = !!info.supportsChunkedSave;
+  if (info.supportsFormSave != null) settings.supportsFormSave = !!info.supportsFormSave;
 }
 
 async function enrichUploadError(postErr, getErr) {
@@ -2622,8 +2667,8 @@ async function enrichUploadError(postErr, getErr) {
     rememberBackendInfo(info);
     saveSettings();
     const ver = info && info.backendVersion != null ? Number(info.backendVersion) : null;
-    if (ver != null && (ver < 37 || info.supportsGetSave === false)) {
-      backendHint = " Backend needs redeploy (v37+ with GET save).";
+    if (ver != null && (ver < 39 || info.supportsChunkedSave === false)) {
+      backendHint = " Backend needs redeploy (v39+ chunked GET save).";
     } else if (ver != null) {
       backendHint = " Backend v" + ver + " OK — retry Upload, or tap Replace with cloud on the other phone.";
     }
@@ -2631,33 +2676,72 @@ async function enrichUploadError(postErr, getErr) {
     backendHint = " Could not reach backend info — check Web App URL / network.";
   }
   const primary = getErr || postErr;
-  return new Error(humanizeUploadError(primary) + backendHint);
+  const detail = formatSyncErrorDetail(primary);
+  return new Error(humanizeUploadError(primary) + " [" + detail + "]" + backendHint);
 }
 
-/** GET ?action=save&payload=base64 fallback when POST transport fails (needs backend v37+). */
+/** Chunked GET ?action=saveChunk when a single payload URL is too long. */
+async function gasSaveViaChunks(b64) {
+  const n = Math.ceil(b64.length / GET_SAVE_CHUNK_CHARS) || 1;
+  const uploadId = "u" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  let last = null;
+  for (let i = 0; i < n; i++) {
+    const chunk = b64.slice(i * GET_SAVE_CHUNK_CHARS, (i + 1) * GET_SAVE_CHUNK_CHARS);
+    const url = settings.scriptUrl +
+      "?action=saveChunk&uploadId=" + encodeURIComponent(uploadId) +
+      "&i=" + i + "&n=" + n +
+      "&chunk=" + encodeURIComponent(chunk);
+    if (url.length > MAX_GET_SAVE_URL) {
+      throw new GasHttpError(414, "Chunk URL still too long (" + url.length + ")");
+    }
+    last = await gasJsonGet(url);
+    if (last && last.ok === false && !last.conflict && !last.waiting) {
+      throw new Error(last.error || "Chunked save failed");
+    }
+    if (last && !last.waiting) return last;
+  }
+  if (!last) throw new Error("Chunked save produced no response");
+  if (last.waiting) {
+    throw new Error("Chunked save incomplete — missing chunks (try again)");
+  }
+  return last;
+}
+
+/** GET ?action=save&payload=base64, or chunked save when URL would be too long. */
 async function gasSaveViaGet(payload) {
   const json = JSON.stringify(payload);
-  if (json.length > 150000) {
-    throw new Error("Upload too large for GET fallback — redeploy Apps Script backend");
-  }
-  const b64 = btoa(unescape(encodeURIComponent(json)));
+  const b64 = utf8ToBase64(json);
   const url = settings.scriptUrl + "?action=save&payload=" + encodeURIComponent(b64);
-  if (url.length > 180000) {
-    throw new Error("Upload too large for GET fallback (URL length)");
+  if (url.length <= MAX_GET_SAVE_URL) {
+    return gasJsonGet(url);
   }
-  return gasJsonGet(url);
+  return gasSaveViaChunks(b64);
 }
 
+/**
+ * Upload transport: text/plain POST → form POST → GET/chunked GET.
+ * GET fallback always runs if every POST attempt fails (any reason).
+ */
 async function gasJsonPost(payload) {
+  let postErr = null;
   try {
     return await gasPostJson(settings.scriptUrl, payload);
   } catch (err) {
-    if (!shouldTryGetSaveFallback(err)) throw err;
-    try {
-      return await gasSaveViaGet(payload);
-    } catch (getErr) {
-      throw await enrichUploadError(err, getErr);
+    postErr = err;
+  }
+  try {
+    return await gasPostForm(settings.scriptUrl, payload);
+  } catch (formErr) {
+    if (!postErr) postErr = formErr;
+    else {
+      formErr.cause = postErr;
+      postErr = formErr;
     }
+  }
+  try {
+    return await gasSaveViaGet(payload);
+  } catch (getErr) {
+    throw await enrichUploadError(postErr, getErr);
   }
 }
 
@@ -2671,8 +2755,8 @@ function recordSyncSuccess(kind) {
 }
 
 function recordSyncError(err, context) {
-  const msg = (context ? context + ": " : "") +
-    (err && err.message ? err.message : String(err));
+  const detail = formatSyncErrorDetail(err);
+  const msg = (context ? context + ": " : "") + detail;
   settings.lastSyncError = { at: new Date().toISOString(), message: msg };
   saveSettings();
   updateSyncDiagnostics();
@@ -2751,6 +2835,8 @@ async function fetchCloudInfo() {
       spreadsheetUrl: out.spreadsheetUrl || null,
       backendVersion: out.backendVersion != null ? out.backendVersion : null,
       supportsGetSave: !!out.supportsGetSave,
+      supportsChunkedSave: !!out.supportsChunkedSave,
+      supportsFormSave: !!out.supportsFormSave,
       legacy: false,
     };
   }
@@ -2758,6 +2844,8 @@ async function fetchCloudInfo() {
   const o2 = await gasJsonGet(settings.scriptUrl + "?action=load");
   const hasData = !!(o2 && o2.ok && o2.data && Array.isArray(o2.data.habits) && o2.data.habits.length > 0);
   settings.supportsGetSave = false;
+  settings.supportsChunkedSave = false;
+  settings.supportsFormSave = false;
   saveSettings();
   return {
     hasData,
@@ -2767,6 +2855,8 @@ async function fetchCloudInfo() {
     spreadsheetUrl: (out && out.spreadsheetUrl) || null,
     backendVersion: null,
     supportsGetSave: false,
+    supportsChunkedSave: false,
+    supportsFormSave: false,
     legacy: !(o2 && o2.revision !== undefined),
   };
 }
@@ -3251,7 +3341,7 @@ async function resolveConflictAuto(cloudOrOut, opts) {
     recordSyncError(err, "Merge upload");
     const msg = humanizeUploadError(err);
     setSyncIndicator("error", "Merged locally — upload failed: " + msg);
-    if (!opts.silent) toast("Merged on this phone — upload failed (see Settings → Last error)");
+    if (!opts.silent) toast("Merged on this phone — upload retry needed (see Last error)");
     return false;
   }
   if (pushed) {
@@ -3264,7 +3354,7 @@ async function resolveConflictAuto(cloudOrOut, opts) {
   localDirty = true;
   autoSyncArmed = true;
   const conflictMsg = "Cloud changed during merge — tap Upload again (data kept on this phone)";
-  recordSyncError(new Error(conflictMsg), "Merge upload");
+  recordSyncError(new Error(conflictMsg), "Merge conflict");
   setSyncIndicator("error", conflictMsg);
   if (!opts.silent) toast(conflictMsg);
   return false;
@@ -3481,15 +3571,22 @@ async function syncNow(opts) {
   try {
     const ok = await pushSnapshot({ silent: opts.silent, force: !!opts.force });
     if (!ok) {
-      // resolveConflictAuto / merge path may already have set Last error + toast.
+      // Conflict / merge path — not a generic transport failure.
       if (settings.lastSyncError && settings.lastSyncError.message) {
-        setSyncIndicator("error", settings.lastSyncError.message.replace(/^Upload:\s*/i, "").replace(/^Merge upload:\s*/i, ""));
+        const raw = settings.lastSyncError.message
+          .replace(/^Upload:\s*/i, "")
+          .replace(/^Merge upload:\s*/i, "")
+          .replace(/^Merge conflict:\s*/i, "");
+        setSyncIndicator("error", raw);
+        if (!opts.silent && /conflict|Cloud changed|Replace with cloud|tap Upload again/i.test(raw)) {
+          toast(raw.length > 90 ? "Cloud conflict — tap Upload again (see Last error)" : raw);
+        }
         return;
       }
       const msg = opts.force
         ? "Master upload did not finish — try again"
-        : "Cloud has newer data — tap Replace with cloud (or Upload again to merge)";
-      recordSyncError(new Error(msg), "Upload");
+        : "Cloud has newer data — tap Upload again to merge (data kept on this phone)";
+      recordSyncError(new Error(msg), "Upload conflict");
       setSyncIndicator("error", msg);
       if (!opts.silent) toast(msg);
       return;

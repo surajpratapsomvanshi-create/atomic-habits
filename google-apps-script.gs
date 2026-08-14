@@ -38,8 +38,8 @@ const LOG_SHEET = "Log";
 const BACKUP_SHEET = "_backup";
 const HISTORY_SHEET = "_history";
 const MAX_HISTORY = 20;
-/** Bump when redeploying; v37+ adds GET ?action=save base64 fallback for mobile. */
-const BACKEND_VERSION = 37;
+/** Bump when redeploying; v37+ GET save; v39+ chunked GET save + form POST. */
+const BACKEND_VERSION = 39;
 
 /* ---------------- HTTP entry points ---------------- */
 
@@ -56,12 +56,53 @@ function decodePayloadParam(payload) {
   return JSON.parse(decoded);
 }
 
-/** Parse POST body — text/plain JSON, or ?payload= after a redirect. */
+/** Parse application/x-www-form-urlencoded body into a key/value map. */
+function parseFormBody(text) {
+  var out = {};
+  String(text || "").split("&").forEach(function (pair) {
+    if (!pair) return;
+    var idx = pair.indexOf("=");
+    var k = idx >= 0 ? pair.slice(0, idx) : pair;
+    var v = idx >= 0 ? pair.slice(idx + 1) : "";
+    try { k = decodeURIComponent(k.replace(/\+/g, " ")); } catch (e1) { /* keep raw */ }
+    try { v = decodeURIComponent(v.replace(/\+/g, " ")); } catch (e2) { /* keep raw */ }
+    out[k] = v;
+  });
+  return out;
+}
+
+/** Parse POST body — text/plain JSON, form payload=, or ?payload= after a redirect. */
 function parseRequestBody(e) {
   if (!e) return null;
   if (e.postData && e.postData.contents) {
     var text = String(e.postData.contents);
-    if (text) return JSON.parse(text);
+    var type = String((e.postData.type || "")).toLowerCase();
+    if (type.indexOf("application/x-www-form-urlencoded") >= 0) {
+      var form = parseFormBody(text);
+      if (form.payload) return decodePayloadParam(form.payload);
+      if (form.action) {
+        return {
+          action: form.action,
+          data: form.data ? safeParse(form.data) : undefined,
+          baseRevision: form.baseRevision != null && form.baseRevision !== ""
+            ? Number(form.baseRevision) : undefined,
+          deviceId: form.deviceId || null,
+          force: form.force === "true" || form.force === true,
+          revision: form.revision,
+        };
+      }
+    }
+    if (text) {
+      // text/plain JSON (preferred CORS-simple POST from the PWA)
+      try { return JSON.parse(text); } catch (errJson) {
+        // Some clients post payload=… without a proper content-type.
+        if (text.indexOf("payload=") === 0) {
+          var form2 = parseFormBody(text);
+          if (form2.payload) return decodePayloadParam(form2.payload);
+        }
+        throw errJson;
+      }
+    }
   }
   var p = getParams(e);
   if (p.payload) return decodePayloadParam(p.payload);
@@ -77,6 +118,59 @@ function parseRequestBody(e) {
     };
   }
   return null;
+}
+
+/**
+ * Assemble chunked GET save uploads (mobile URL length limits).
+ * Chunks are fragments of base64(JSON body); final chunk runs handleSave.
+ */
+function handleSaveChunk(p) {
+  var uploadId = String(p.uploadId || "").replace(/[^a-zA-Z0-9_-]/g, "");
+  var i = Number(p.i);
+  var n = Number(p.n);
+  var chunk = String(p.chunk || "").replace(/ /g, "+");
+  if (!uploadId || !(n > 0) || n > 200 || isNaN(i) || i < 0 || i >= n || !chunk) {
+    return json({ ok: false, error: "Bad saveChunk params" });
+  }
+  var cache = CacheService.getScriptCache();
+  var prefix = "ahc_" + uploadId + "_";
+  cache.put(prefix + String(i), chunk, 600);
+  cache.put(prefix + "n", String(n), 600);
+
+  var parts = [];
+  var missing = [];
+  for (var k = 0; k < n; k++) {
+    var part = cache.get(prefix + String(k));
+    if (part == null) missing.push(k);
+    else parts.push(part);
+  }
+  if (missing.length) {
+    return json({
+      ok: true,
+      waiting: true,
+      received: n - missing.length,
+      total: n,
+      missing: missing.length,
+    });
+  }
+
+  // Clear chunk keys best-effort, then decode + save under lock.
+  try {
+    var keys = [];
+    for (var c = 0; c < n; c++) keys.push(prefix + String(c));
+    keys.push(prefix + "n");
+    cache.removeAll(keys);
+  } catch (eClear) { /* ignore */ }
+
+  var body;
+  try {
+    body = decodePayloadParam(parts.join(""));
+  } catch (errDec) {
+    return json({ ok: false, error: "Bad chunked save payload: " + String(errDec) });
+  }
+  return withLock(function () {
+    return dispatchAction(body);
+  });
 }
 
 function withLock(fn) {
@@ -211,6 +305,15 @@ function doGet(e) {
       });
     }
 
+    /** Chunked GET save when a single ?payload= URL would be too long. */
+    if (action === "saveChunk") {
+      try {
+        return handleSaveChunk(p);
+      } catch (errChunk) {
+        return json({ ok: false, error: "saveChunk failed: " + String(errChunk) });
+      }
+    }
+
     if (action === "load") {
       var ss = getSpreadsheet();
       ensureTabs(ss);
@@ -245,6 +348,8 @@ function doGet(e) {
         deviceId: metaInfo.deviceId,
         backendVersion: BACKEND_VERSION,
         supportsGetSave: true,
+        supportsChunkedSave: true,
+        supportsFormSave: true,
       });
     }
 
@@ -272,6 +377,8 @@ function doGet(e) {
       message: "Atomic Habits backend is running",
       backendVersion: BACKEND_VERSION,
       supportsGetSave: true,
+      supportsChunkedSave: true,
+      supportsFormSave: true,
       spreadsheetUrl: ssDefault.getUrl(),
     });
   } catch (err) {
