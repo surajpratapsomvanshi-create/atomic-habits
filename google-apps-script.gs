@@ -38,8 +38,8 @@ const LOG_SHEET = "Log";
 const BACKUP_SHEET = "_backup";
 const HISTORY_SHEET = "_history";
 const MAX_HISTORY = 20;
-/** Bump when redeploying; v37+ GET save; v39+ chunked GET save + form POST. */
-const BACKEND_VERSION = 39;
+/** Bump when redeploying; v37+ GET save; v39+ chunked GET save + form POST; v40+ locked PropertiesService chunks. */
+const BACKEND_VERSION = 40;
 
 /* ---------------- HTTP entry points ---------------- */
 
@@ -123,6 +123,7 @@ function parseRequestBody(e) {
 /**
  * Assemble chunked GET save uploads (mobile URL length limits).
  * Chunks are fragments of base64(JSON body); final chunk runs handleSave.
+ * Uses LockService + PropertiesService (more consistent than CacheService alone).
  */
 function handleSaveChunk(p) {
   var uploadId = String(p.uploadId || "").replace(/[^a-zA-Z0-9_-]/g, "");
@@ -132,45 +133,64 @@ function handleSaveChunk(p) {
   if (!uploadId || !(n > 0) || n > 200 || isNaN(i) || i < 0 || i >= n || !chunk) {
     return json({ ok: false, error: "Bad saveChunk params" });
   }
-  var cache = CacheService.getScriptCache();
-  var prefix = "ahc_" + uploadId + "_";
-  cache.put(prefix + String(i), chunk, 600);
-  cache.put(prefix + "n", String(n), 600);
 
-  var parts = [];
-  var missing = [];
-  for (var k = 0; k < n; k++) {
-    var part = cache.get(prefix + String(k));
-    if (part == null) missing.push(k);
-    else parts.push(part);
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    return json({ ok: false, error: "Server busy — try again in a few seconds" });
   }
-  if (missing.length) {
-    return json({
-      ok: true,
-      waiting: true,
-      received: n - missing.length,
-      total: n,
-      missing: missing.length,
-    });
-  }
-
-  // Clear chunk keys best-effort, then decode + save under lock.
   try {
-    var keys = [];
-    for (var c = 0; c < n; c++) keys.push(prefix + String(c));
-    keys.push(prefix + "n");
-    cache.removeAll(keys);
-  } catch (eClear) { /* ignore */ }
+    var props = PropertiesService.getScriptProperties();
+    var prefix = "ahc_" + uploadId + "_";
+    props.setProperty(prefix + String(i), chunk);
+    props.setProperty(prefix + "n", String(n));
 
-  var body;
-  try {
-    body = decodePayloadParam(parts.join(""));
-  } catch (errDec) {
-    return json({ ok: false, error: "Bad chunked save payload: " + String(errDec) });
-  }
-  return withLock(function () {
+    var missing = [];
+    var parts = [];
+    for (var k = 0; k < n; k++) {
+      var part = props.getProperty(prefix + String(k));
+      if (part == null || part === "") missing.push(k);
+      else parts.push(part);
+    }
+    if (missing.length) {
+      // Also mirror into CacheService for older mid-flight clients / dual-path.
+      try {
+        var cache = CacheService.getScriptCache();
+        cache.put(prefix + String(i), chunk, 600);
+        cache.put(prefix + "n", String(n), 600);
+      } catch (eCache) { /* ignore */ }
+      return json({
+        ok: true,
+        waiting: true,
+        received: n - missing.length,
+        total: n,
+        missing: missing.length,
+        missingIndices: missing,
+      });
+    }
+
+    // Clear chunk keys best-effort, then decode + save.
+    try {
+      for (var c = 0; c < n; c++) props.deleteProperty(prefix + String(c));
+      props.deleteProperty(prefix + "n");
+    } catch (eClear) { /* ignore */ }
+    try {
+      var cache2 = CacheService.getScriptCache();
+      var ckeys = [];
+      for (var c2 = 0; c2 < n; c2++) ckeys.push(prefix + String(c2));
+      ckeys.push(prefix + "n");
+      cache2.removeAll(ckeys);
+    } catch (eClear2) { /* ignore */ }
+
+    var body;
+    try {
+      body = decodePayloadParam(parts.join(""));
+    } catch (errDec) {
+      return json({ ok: false, error: "Bad chunked save payload: " + String(errDec) });
+    }
     return dispatchAction(body);
-  });
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function withLock(fn) {

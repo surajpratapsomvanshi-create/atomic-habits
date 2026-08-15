@@ -1,4 +1,4 @@
-const CACHE = "atomic-habits-v39.1";
+const CACHE = "atomic-habits-v40";
 const ASSETS = [
   "./",
   "./index.html",
@@ -41,6 +41,7 @@ function isShellRequest(url) {
 self.addEventListener("fetch", e => {
   // never cache sync calls to Apps Script
   if (e.request.url.includes("script.google.com")) return;
+  if (e.request.url.includes("script.googleusercontent.com")) return;
   if (e.request.method !== "GET") return;
 
   // Network-first for app shell so new logic reaches phones stuck on old caches.

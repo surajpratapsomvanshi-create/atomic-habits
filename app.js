@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "39";
+const APP_VERSION = "40";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -2536,8 +2536,90 @@ function utf8ToBase64(str) {
   return btoa(unescape(encodeURIComponent(str)));
 }
 
-async function gasJsonGet(url) {
-  const res = await fetch(url, { method: "GET", cache: "no-store" });
+/**
+ * Whitelist snapshot fields for upload — drops _history and any other
+ * oversized/redundant keys while keeping habits/checks/counts/punches.
+ */
+function slimDataForUpload(raw) {
+  const d = raw && typeof raw === "object" ? raw : {};
+  return {
+    habits: Array.isArray(d.habits) ? d.habits : [],
+    checks: d.checks && typeof d.checks === "object" ? d.checks : {},
+    counts: d.counts && typeof d.counts === "object" ? d.counts : {},
+    lastUsedAt: d.lastUsedAt && typeof d.lastUsedAt === "object" ? d.lastUsedAt : {},
+    punches: Array.isArray(d.punches) ? stripSyntheticPunches(d.punches) : [],
+    lists: Array.isArray(d.lists) ? d.lists : [],
+    activeListId: d.activeListId || null,
+  };
+}
+
+/** Clone save body with slimmed `data` (and no accidental _history). */
+function slimSavePayload(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  const out = Object.assign({}, payload);
+  if (Object.prototype.hasOwnProperty.call(payload, "data")) {
+    out.data = slimDataForUpload(payload.data);
+  }
+  delete out._history;
+  return out;
+}
+
+/** Bare doGet / redirect-stripped responses look "ok" but never saved. */
+function isNoopBackendResponse(out) {
+  if (!out || typeof out !== "object") return true;
+  if (out.waiting || out.conflict) return false;
+  if (out.ok && out.revision != null) return false;
+  if (out.ok === false && (out.error || out.conflict)) return false;
+  const msg = String(out.message || "");
+  if (/backend is running/i.test(msg)) return true;
+  if (out.ok === true && out.revision == null && !out.waiting) return true;
+  return false;
+}
+
+function sleepMs(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+/**
+ * GET via XHR — fetch() on mobile Chrome/PWA often mishandles Apps Script's
+ * long redirect chain and returns the bare /exec "backend is running" body.
+ */
+function gasJsonGet(url) {
+  return new Promise(function (resolve, reject) {
+    const xhr = new XMLHttpRequest();
+    xhr.open("GET", url, true);
+    xhr.timeout = 120000;
+    xhr.onload = function () {
+      const text = xhr.responseText || "";
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (!String(text).trim()) {
+          reject(new Error("Empty response from cloud"));
+          return;
+        }
+        try { resolve(JSON.parse(text)); }
+        catch (_) {
+          reject(new GasHttpError(xhr.status, "invalid JSON: " + String(text).slice(0, 120)));
+        }
+      } else {
+        reject(new GasHttpError(xhr.status, text));
+      }
+    };
+    xhr.onerror = function () {
+      reject(new GasHttpError(0, "Network error — can't reach cloud (GET)"));
+    };
+    xhr.ontimeout = function () { reject(new Error("Cloud GET timed out (120s)")); };
+    xhr.send();
+  });
+}
+
+/** fetch() GET fallback (desktop / when XHR blocked). */
+async function gasJsonGetFetch(url) {
+  const res = await fetch(url, {
+    method: "GET",
+    cache: "no-store",
+    redirect: "follow",
+    credentials: "omit",
+  });
   const text = await res.text();
   if (!res.ok) throw new GasHttpError(res.status, text);
   if (!String(text).trim()) throw new Error("Empty response from cloud");
@@ -2554,12 +2636,12 @@ async function gasJsonGet(url) {
  */
 function gasPostJson(url, payload) {
   const body = JSON.stringify(payload);
-  return new Promise((resolve, reject) => {
+  return new Promise(function (resolve, reject) {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url, true);
     xhr.setRequestHeader("Content-Type", "text/plain;charset=utf-8");
     xhr.timeout = 120000;
-    xhr.onload = () => {
+    xhr.onload = function () {
       const text = xhr.responseText || "";
       if (xhr.status >= 200 && xhr.status < 300) {
         if (!String(text).trim()) {
@@ -2572,8 +2654,10 @@ function gasPostJson(url, payload) {
         reject(new GasHttpError(xhr.status, text));
       }
     };
-    xhr.onerror = () => reject(new GasHttpError(0, "Network error — can't reach cloud (XHR POST)"));
-    xhr.ontimeout = () => reject(new Error("Upload timed out (120s)"));
+    xhr.onerror = function () {
+      reject(new GasHttpError(0, "Network error — can't reach cloud (XHR POST)"));
+    };
+    xhr.ontimeout = function () { reject(new Error("Upload timed out (120s)")); };
     xhr.send(body);
   });
 }
@@ -2585,12 +2669,12 @@ function gasPostJson(url, payload) {
 function gasPostForm(url, payload) {
   const b64 = utf8ToBase64(JSON.stringify(payload));
   const body = "payload=" + encodeURIComponent(b64);
-  return new Promise((resolve, reject) => {
+  return new Promise(function (resolve, reject) {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url, true);
     xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded;charset=utf-8");
     xhr.timeout = 120000;
-    xhr.onload = () => {
+    xhr.onload = function () {
       const text = xhr.responseText || "";
       if (xhr.status >= 200 && xhr.status < 300) {
         if (!String(text).trim()) {
@@ -2603,15 +2687,43 @@ function gasPostForm(url, payload) {
         reject(new GasHttpError(xhr.status, text));
       }
     };
-    xhr.onerror = () => reject(new GasHttpError(0, "Network error — can't reach cloud (form POST)"));
-    xhr.ontimeout = () => reject(new Error("Form upload timed out (120s)"));
+    xhr.onerror = function () {
+      reject(new GasHttpError(0, "Network error — can't reach cloud (form POST)"));
+    };
+    xhr.ontimeout = function () { reject(new Error("Form upload timed out (120s)")); };
     xhr.send(body);
   });
 }
 
-/** Keep GET URLs under typical mobile / Apps Script query limits. */
+/** fetch() text/plain POST with redirect follow (some WebViews prefer this). */
+async function gasPostJsonFetch(url, payload) {
+  const res = await fetch(url, {
+    method: "POST",
+    cache: "no-store",
+    redirect: "follow",
+    credentials: "omit",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify(payload),
+  });
+  const text = await res.text();
+  if (!res.ok) throw new GasHttpError(res.status, text);
+  if (!String(text).trim()) throw new Error("Empty response on fetch upload");
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    throw new GasHttpError(res.status || 200, "invalid JSON: " + String(text).slice(0, 120));
+  }
+}
+
+/**
+ * Keep GET URLs under mobile / proxy limits (~2KB safe; 7KB absolute max).
+ * Smaller chunks = more requests but survive aggressive URL truncation.
+ */
 const MAX_GET_SAVE_URL = 7000;
-const GET_SAVE_CHUNK_CHARS = 1200;
+const MAX_GET_SAVE_URL_SAFE = 1800;
+const GET_SAVE_CHUNK_CHARS = 500;
+const GET_SAVE_CHUNK_CHARS_TINY = 280;
+const CHUNK_GAP_MS = 120;
 
 /** Turn raw transport errors into Settings-friendly actions. */
 function humanizeUploadError(err) {
@@ -2621,7 +2733,7 @@ function humanizeUploadError(err) {
     return "Backend auth blocked — redeploy Apps Script (Who has access: Anyone)";
   }
   if (status === 414 || /too large|URI Too Long|Chunk URL/i.test(msg)) {
-    return "Upload too large for GET fallback — needs backend v39+ chunked save (redeploy Apps Script)";
+    return "Upload too large for GET fallback — retry on Wi‑Fi; if it persists update the app";
   }
   if (status === 404 || status === 405 || status === 411) {
     return "Upload blocked by Apps Script redirect (HTTP " + status + ") — retry; redeploy backend if it persists";
@@ -2634,6 +2746,9 @@ function humanizeUploadError(err) {
   }
   if (/timed out/i.test(msg)) {
     return "Upload timed out — try again on Wi‑Fi";
+  }
+  if (/backend is running|incomplete/i.test(msg)) {
+    return "Upload redirect dropped the payload — retry Upload (app will use smaller chunks)";
   }
   return msg;
 }
@@ -2667,10 +2782,12 @@ async function enrichUploadError(postErr, getErr) {
     rememberBackendInfo(info);
     saveSettings();
     const ver = info && info.backendVersion != null ? Number(info.backendVersion) : null;
-    if (ver != null && (ver < 39 || info.supportsChunkedSave === false)) {
-      backendHint = " Backend needs redeploy (v39+ chunked GET save).";
+    if (ver != null && ver < 37) {
+      backendHint = " Backend is very old — redeploy Apps Script from _publish/google-apps-script.gs.";
+    } else if (ver != null && (ver < 39 || info.supportsChunkedSave === false)) {
+      backendHint = " Backend v" + ver + " (no chunked save) — app will keep trying slim GET/POST.";
     } else if (ver != null) {
-      backendHint = " Backend v" + ver + " OK — retry Upload, or tap Replace with cloud on the other phone.";
+      backendHint = " Backend v" + ver + " OK — retry Upload once on Wi‑Fi.";
     }
   } catch (_) {
     backendHint = " Could not reach backend info — check Web App URL / network.";
@@ -2680,26 +2797,65 @@ async function enrichUploadError(postErr, getErr) {
   return new Error(humanizeUploadError(primary) + " [" + detail + "]" + backendHint);
 }
 
-/** Reject non-save JSON (e.g. old backend ignoring saveChunk). */
+/** Reject non-save JSON (e.g. redirect stripped to bare doGet). */
 function assertSaveTransportResult(out, via) {
   if (!out) throw new Error("Empty save result via " + via);
   if (out.waiting) return out;
   if (out.conflict) return out;
   if (out.ok && out.revision != null) return out;
   if (out.ok === false && out.error) throw new Error(out.error);
+  if (isNoopBackendResponse(out)) {
+    throw new Error(
+      "Save via " + via + " incomplete — redirect dropped payload (" +
+      String(out.message || out.error || "no revision").slice(0, 100) + ")"
+    );
+  }
   throw new Error(
-    "Save via " + via + " incomplete — redeploy Apps Script backend v39+ (" +
+    "Save via " + via + " incomplete (" +
     String(out.message || out.error || "no revision").slice(0, 100) + ")"
   );
 }
 
+/** One chunk GET with retries — prefers XHR, falls back to fetch. */
+async function gasGetSaveOnce(url) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await sleepMs(200 * attempt);
+    try {
+      const out = await gasJsonGet(url);
+      if (isNoopBackendResponse(out) && !out.waiting && !out.conflict) {
+        lastErr = new Error("noop backend response");
+        continue;
+      }
+      return out;
+    } catch (err) {
+      lastErr = err;
+      try {
+        const out2 = await gasJsonGetFetch(url);
+        if (isNoopBackendResponse(out2) && !out2.waiting && !out2.conflict) {
+          lastErr = new Error("noop backend response (fetch)");
+          continue;
+        }
+        return out2;
+      } catch (err2) {
+        lastErr = err2;
+      }
+    }
+  }
+  throw lastErr || new Error("GET save failed");
+}
+
 /** Chunked GET ?action=saveChunk when a single payload URL is too long. */
-async function gasSaveViaChunks(b64) {
-  const n = Math.ceil(b64.length / GET_SAVE_CHUNK_CHARS) || 1;
+async function gasSaveViaChunks(b64, chunkChars) {
+  const size = chunkChars > 0 ? chunkChars : GET_SAVE_CHUNK_CHARS;
+  const n = Math.ceil(b64.length / size) || 1;
+  if (n > 200) {
+    throw new GasHttpError(414, "Payload needs too many chunks (" + n + ") — shrink data or use Wi‑Fi POST");
+  }
   const uploadId = "u" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   let last = null;
   for (let i = 0; i < n; i++) {
-    const chunk = b64.slice(i * GET_SAVE_CHUNK_CHARS, (i + 1) * GET_SAVE_CHUNK_CHARS);
+    const chunk = b64.slice(i * size, (i + 1) * size);
     const url = settings.scriptUrl +
       "?action=saveChunk&uploadId=" + encodeURIComponent(uploadId) +
       "&i=" + i + "&n=" + n +
@@ -2707,8 +2863,22 @@ async function gasSaveViaChunks(b64) {
     if (url.length > MAX_GET_SAVE_URL) {
       throw new GasHttpError(414, "Chunk URL still too long (" + url.length + ")");
     }
-    last = assertSaveTransportResult(await gasJsonGet(url), "saveChunk");
+    if (i > 0) await sleepMs(CHUNK_GAP_MS);
+    last = assertSaveTransportResult(await gasGetSaveOnce(url), "saveChunk");
     if (last && !last.waiting) return last;
+  }
+  // Final pass: re-send every chunk once more (CacheService race on busy backends).
+  if (last && last.waiting) {
+    for (let i = 0; i < n; i++) {
+      const chunk = b64.slice(i * size, (i + 1) * size);
+      const url = settings.scriptUrl +
+        "?action=saveChunk&uploadId=" + encodeURIComponent(uploadId) +
+        "&i=" + i + "&n=" + n +
+        "&chunk=" + encodeURIComponent(chunk);
+      await sleepMs(CHUNK_GAP_MS);
+      last = assertSaveTransportResult(await gasGetSaveOnce(url), "saveChunk");
+      if (last && !last.waiting) return last;
+    }
   }
   if (!last) throw new Error("Chunked save produced no response");
   if (last.waiting) {
@@ -2719,37 +2889,57 @@ async function gasSaveViaChunks(b64) {
 
 /** GET ?action=save&payload=base64, or chunked save when URL would be too long. */
 async function gasSaveViaGet(payload) {
-  const json = JSON.stringify(payload);
+  const body = slimSavePayload(payload);
+  const json = JSON.stringify(body);
   const b64 = utf8ToBase64(json);
   const url = settings.scriptUrl + "?action=save&payload=" + encodeURIComponent(b64);
-  if (url.length <= MAX_GET_SAVE_URL) {
-    return assertSaveTransportResult(await gasJsonGet(url), "GET save");
+  if (url.length <= MAX_GET_SAVE_URL_SAFE || url.length <= MAX_GET_SAVE_URL) {
+    if (url.length <= MAX_GET_SAVE_URL) {
+      try {
+        return assertSaveTransportResult(await gasGetSaveOnce(url), "GET save");
+      } catch (err) {
+        if (url.length <= MAX_GET_SAVE_URL_SAFE) throw err;
+        // Long single GET failed — fall through to chunks.
+      }
+    }
   }
-  return gasSaveViaChunks(b64);
+  const chunkedOk = settings.supportsChunkedSave !== false;
+  const ver = settings.backendVersion != null ? Number(settings.backendVersion) : null;
+  if (!chunkedOk && ver != null && ver < 39) {
+    throw new GasHttpError(414, "Upload too large for single GET on backend v" + ver);
+  }
+  try {
+    return await gasSaveViaChunks(b64, GET_SAVE_CHUNK_CHARS);
+  } catch (err) {
+    return await gasSaveViaChunks(b64, GET_SAVE_CHUNK_CHARS_TINY);
+  }
 }
 
 /**
- * Upload transport: text/plain POST → form POST → GET/chunked GET.
- * GET fallback always runs if every POST attempt fails (any reason).
+ * Upload transport: slim payload, then
+ * text/plain XHR → form XHR → fetch POST → GET/chunked GET.
  */
 async function gasJsonPost(payload) {
+  const body = slimSavePayload(payload);
   let postErr = null;
-  try {
-    return assertSaveTransportResult(await gasPostJson(settings.scriptUrl, payload), "POST");
-  } catch (err) {
-    postErr = err;
-  }
-  try {
-    return assertSaveTransportResult(await gasPostForm(settings.scriptUrl, payload), "form POST");
-  } catch (formErr) {
-    if (!postErr) postErr = formErr;
-    else {
-      formErr.cause = postErr;
-      postErr = formErr;
+  const attempts = [
+    { via: "POST", run: function () { return gasPostJson(settings.scriptUrl, body); } },
+    { via: "form POST", run: function () { return gasPostForm(settings.scriptUrl, body); } },
+    { via: "fetch POST", run: function () { return gasPostJsonFetch(settings.scriptUrl, body); } },
+  ];
+  for (let a = 0; a < attempts.length; a++) {
+    try {
+      return assertSaveTransportResult(await attempts[a].run(), attempts[a].via);
+    } catch (err) {
+      if (!postErr) postErr = err;
+      else {
+        err.cause = postErr;
+        postErr = err;
+      }
     }
   }
   try {
-    return await gasSaveViaGet(payload);
+    return await gasSaveViaGet(body);
   } catch (getErr) {
     throw await enrichUploadError(postErr, getErr);
   }
