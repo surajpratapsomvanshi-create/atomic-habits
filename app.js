@@ -2721,9 +2721,10 @@ async function gasPostJsonFetch(url, payload) {
  */
 const MAX_GET_SAVE_URL = 7000;
 const MAX_GET_SAVE_URL_SAFE = 1800;
-const GET_SAVE_CHUNK_CHARS = 500;
-const GET_SAVE_CHUNK_CHARS_TINY = 280;
-const CHUNK_GAP_MS = 120;
+/** ~900 keeps URLs under ~1.3KB (mobile-safe) while limiting round-trips. */
+const GET_SAVE_CHUNK_CHARS = 900;
+const GET_SAVE_CHUNK_CHARS_TINY = 350;
+const CHUNK_GAP_MS = 80;
 
 /** Turn raw transport errors into Settings-friendly actions. */
 function humanizeUploadError(err) {
