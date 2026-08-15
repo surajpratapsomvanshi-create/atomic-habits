@@ -1,4 +1,4 @@
-const CACHE = "atomic-habits-v40";
+const CACHE = "atomic-habits-v41";
 const ASSETS = [
   "./",
   "./index.html",

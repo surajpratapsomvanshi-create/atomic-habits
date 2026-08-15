@@ -27,11 +27,42 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "40";
+const APP_VERSION = "41";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbxxcZhrVNYDpg4ZUfFQNDGudJKUJENaQRRcoyMio8_YEdo5GoKscHAGyUhEd0iK9NkG/exec";
+
+/**
+ * Normalize Web App URL: trim, strip trailing junk, ensure …/exec.
+ * Mobile paste often drops /exec or adds whitespace → Failed to fetch / CORS.
+ */
+function normalizeScriptUrl(raw) {
+  let u = String(raw || "").trim().replace(/[\u200B-\u200D\uFEFF]/g, "");
+  if (!u) return "";
+  // Drop fragment / accidental trailing punctuation from paste.
+  u = u.replace(/[\]\).,;]+$/g, "");
+  try {
+    const parsed = new URL(u);
+    if (!/^https?:$/i.test(parsed.protocol)) return u;
+    let path = parsed.pathname.replace(/\/+$/, "");
+    // Accept /macros/s/<id> or /macros/s/<id>/exec (and /dev → treat as needing /exec).
+    if (/\/macros\/s\/[^/]+$/i.test(path)) {
+      path = path + "/exec";
+    } else if (/\/macros\/s\/[^/]+\/dev$/i.test(path)) {
+      path = path.replace(/\/dev$/i, "/exec");
+    }
+    parsed.pathname = path;
+    parsed.hash = "";
+    // Keep only harmless query; Apps Script web apps use path + our ?action=
+    return parsed.origin + parsed.pathname;
+  } catch (_) {
+    if (/script\.google\.com\/macros\/s\/[^/\s]+$/i.test(u) && !/\/exec$/i.test(u)) {
+      return u.replace(/\/+$/, "") + "/exec";
+    }
+    return u;
+  }
+}
 
 /** Default poll interval when auto-refresh is on. */
 const DEFAULT_POLL_MS = 45000;
@@ -180,6 +211,14 @@ function loadSettings() {
   if (!merged.scriptUrl || !String(merged.scriptUrl).trim()) {
     merged.scriptUrl = DEFAULT_SCRIPT_URL;
     dirty = true;
+  } else {
+    const normalized = normalizeScriptUrl(merged.scriptUrl);
+    if (normalized && normalized !== merged.scriptUrl) {
+      merged.scriptUrl = normalized;
+      dirty = true;
+    } else if (normalized) {
+      merged.scriptUrl = normalized;
+    }
   }
   if (!merged.deviceId) {
     merged.deviceId = makeDeviceId();
@@ -2581,14 +2620,17 @@ function sleepMs(ms) {
 }
 
 /**
- * GET via XHR — fetch() on mobile Chrome/PWA often mishandles Apps Script's
- * long redirect chain and returns the bare /exec "backend is running" body.
+ * ALL Apps Script calls use XHR only.
+ * fetch() on mobile Chrome/PWA throws "Failed to fetch" on GAS's
+ * script.google.com → script.googleusercontent.com redirect, or else
+ * returns the bare /exec "backend is running" body instead of JSON.
  */
 function gasJsonGet(url) {
   return new Promise(function (resolve, reject) {
     const xhr = new XMLHttpRequest();
     xhr.open("GET", url, true);
     xhr.timeout = 120000;
+    xhr.withCredentials = false;
     xhr.onload = function () {
       const text = xhr.responseText || "";
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -2605,29 +2647,11 @@ function gasJsonGet(url) {
       }
     };
     xhr.onerror = function () {
-      reject(new GasHttpError(0, "Network error — can't reach cloud (GET)"));
+      reject(new GasHttpError(0, "Network error — can't reach cloud (XHR GET)"));
     };
     xhr.ontimeout = function () { reject(new Error("Cloud GET timed out (120s)")); };
     xhr.send();
   });
-}
-
-/** fetch() GET fallback (desktop / when XHR blocked). */
-async function gasJsonGetFetch(url) {
-  const res = await fetch(url, {
-    method: "GET",
-    cache: "no-store",
-    redirect: "follow",
-    credentials: "omit",
-  });
-  const text = await res.text();
-  if (!res.ok) throw new GasHttpError(res.status, text);
-  if (!String(text).trim()) throw new Error("Empty response from cloud");
-  try {
-    return JSON.parse(text);
-  } catch (_) {
-    throw new GasHttpError(res.status || 200, "invalid JSON: " + String(text).slice(0, 120));
-  }
 }
 
 /**
@@ -2641,6 +2665,7 @@ function gasPostJson(url, payload) {
     xhr.open("POST", url, true);
     xhr.setRequestHeader("Content-Type", "text/plain;charset=utf-8");
     xhr.timeout = 120000;
+    xhr.withCredentials = false;
     xhr.onload = function () {
       const text = xhr.responseText || "";
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -2674,6 +2699,7 @@ function gasPostForm(url, payload) {
     xhr.open("POST", url, true);
     xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded;charset=utf-8");
     xhr.timeout = 120000;
+    xhr.withCredentials = false;
     xhr.onload = function () {
       const text = xhr.responseText || "";
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -2693,26 +2719,6 @@ function gasPostForm(url, payload) {
     xhr.ontimeout = function () { reject(new Error("Form upload timed out (120s)")); };
     xhr.send(body);
   });
-}
-
-/** fetch() text/plain POST with redirect follow (some WebViews prefer this). */
-async function gasPostJsonFetch(url, payload) {
-  const res = await fetch(url, {
-    method: "POST",
-    cache: "no-store",
-    redirect: "follow",
-    credentials: "omit",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify(payload),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new GasHttpError(res.status, text);
-  if (!String(text).trim()) throw new Error("Empty response on fetch upload");
-  try {
-    return JSON.parse(text);
-  } catch (_) {
-    throw new GasHttpError(res.status || 200, "invalid JSON: " + String(text).slice(0, 120));
-  }
 }
 
 /**
@@ -2743,7 +2749,7 @@ function humanizeUploadError(err) {
     return "Cloud returned a bad upload response (redirect/HTML) — retry; if it persists redeploy backend";
   }
   if (/Network error|Failed to fetch|Load failed|status\":\s*0|HTTP 0/i.test(msg)) {
-    return "Network error on upload — check connection; Settings → Last error for details";
+    return "Network error on upload — check connection; tap Retry connection; Settings → Last error for details";
   }
   if (/timed out/i.test(msg)) {
     return "Upload timed out — try again on Wi‑Fi";
@@ -2777,9 +2783,10 @@ function rememberBackendInfo(info) {
 }
 
 async function enrichUploadError(postErr, getErr) {
+  const testUrl = (settings.scriptUrl || DEFAULT_SCRIPT_URL) + "?action=info";
   let backendHint = "";
   try {
-    const info = await gasJsonGet(settings.scriptUrl + "?action=info");
+    const info = await gasJsonGet(testUrl);
     rememberBackendInfo(info);
     saveSettings();
     const ver = info && info.backendVersion != null ? Number(info.backendVersion) : null;
@@ -2790,8 +2797,12 @@ async function enrichUploadError(postErr, getErr) {
     } else if (ver != null) {
       backendHint = " Backend v" + ver + " OK — retry Upload once on Wi‑Fi.";
     }
-  } catch (_) {
-    backendHint = " Could not reach backend info — check Web App URL / network.";
+  } catch (infoErr) {
+    const infoDetail = formatSyncErrorDetail(infoErr);
+    backendHint =
+      " Could not reach backend info (" + infoDetail + "). " +
+      "Open this URL in Chrome to test: " + testUrl +
+      " — then tap Retry connection.";
   }
   const primary = getErr || postErr;
   const detail = formatSyncErrorDetail(primary);
@@ -2817,7 +2828,7 @@ function assertSaveTransportResult(out, via) {
   );
 }
 
-/** One chunk GET with retries — prefers XHR, falls back to fetch. */
+/** One chunk GET with retries — XHR only (never fetch; mobile Failed to fetch on GAS redirects). */
 async function gasGetSaveOnce(url) {
   let lastErr = null;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -2831,16 +2842,6 @@ async function gasGetSaveOnce(url) {
       return out;
     } catch (err) {
       lastErr = err;
-      try {
-        const out2 = await gasJsonGetFetch(url);
-        if (isNoopBackendResponse(out2) && !out2.waiting && !out2.conflict) {
-          lastErr = new Error("noop backend response (fetch)");
-          continue;
-        }
-        return out2;
-      } catch (err2) {
-        lastErr = err2;
-      }
     }
   }
   throw lastErr || new Error("GET save failed");
@@ -2918,7 +2919,8 @@ async function gasSaveViaGet(payload) {
 
 /**
  * Upload transport: slim payload, then
- * text/plain XHR → form XHR → fetch POST → GET/chunked GET.
+ * text/plain XHR → form XHR → GET/chunked GET.
+ * Never use bare fetch() — mobile Chrome throws Failed to fetch on GAS redirects.
  */
 async function gasJsonPost(payload) {
   const body = slimSavePayload(payload);
@@ -2926,7 +2928,6 @@ async function gasJsonPost(payload) {
   const attempts = [
     { via: "POST", run: function () { return gasPostJson(settings.scriptUrl, body); } },
     { via: "form POST", run: function () { return gasPostForm(settings.scriptUrl, body); } },
-    { via: "fetch POST", run: function () { return gasPostJsonFetch(settings.scriptUrl, body); } },
   ];
   for (let a = 0; a < attempts.length; a++) {
     try {
@@ -3719,6 +3720,8 @@ async function pushSnapshot(opts) {
  */
 async function syncNow(opts) {
   opts = opts || {};
+  settings.scriptUrl = normalizeScriptUrl(settings.scriptUrl) || settings.scriptUrl;
+  if (urlInput) urlInput.value = settings.scriptUrl || urlInput.value;
   if (!settings.scriptUrl) { toast("Set the Web App URL in Settings first"); return; }
 
   // New/blank device with cloud data → restore first instead of uploading seeds.
@@ -4155,13 +4158,56 @@ if (pollIntervalInput) {
   const ms = pollIntervalMs();
   pollIntervalInput.value = String([15000, 45000, 60000].includes(ms) ? ms : DEFAULT_POLL_MS);
 }
-urlInput.addEventListener("change", async () => {
-  settings.scriptUrl = urlInput.value.trim();
+
+/** Apply + normalize Web App URL from the Settings field (ensures …/exec). */
+function applyScriptUrlFromInput() {
+  const normalized = normalizeScriptUrl(urlInput.value) || DEFAULT_SCRIPT_URL;
+  settings.scriptUrl = normalized;
+  urlInput.value = normalized;
   saveSettings();
+  return normalized;
+}
+
+/** Probe ?action=info and show a clear pass/fail (for Retry connection). */
+async function retryCloudConnection() {
+  applyScriptUrlFromInput();
+  const testUrl = settings.scriptUrl + "?action=info";
+  setSyncIndicator("pending", "Testing connection…");
+  toast("Testing cloud connection…");
+  try {
+    const info = await gasJsonGet(testUrl);
+    rememberBackendInfo(info);
+    saveSettings();
+    updateSyncSafetyText(info);
+    recordSyncSuccess("pull");
+    const ver = info && info.backendVersion != null ? "v" + info.backendVersion : "?";
+    const rev = info && info.revision != null ? info.revision : "—";
+    setSyncIndicator("ok", "Connected — backend " + ver + ", cloud rev " + rev);
+    toast("Connected (backend " + ver + ", rev " + rev + ")");
+    autoSyncArmed = false;
+    cloudChecked = false;
+    await initSync();
+    return true;
+  } catch (err) {
+    const detail = formatSyncErrorDetail(err);
+    const msg =
+      "Connection failed — open this URL in Chrome to test: " + testUrl +
+      " [" + detail + "]";
+    recordSyncError(new Error(msg), "Connection");
+    setSyncIndicator("error", "Can't reach backend — see Last error");
+    toast("Can't reach backend — open the test URL (see Last error)");
+    return false;
+  }
+}
+
+urlInput.addEventListener("change", async () => {
+  applyScriptUrlFromInput();
   autoSyncArmed = false;
   cloudChecked = false;
   await initSync();
 });
+const btnRetryConn = document.getElementById("btn-retry-connection");
+if (btnRetryConn) btnRetryConn.addEventListener("click", () => retryCloudConnection());
 autoSyncInput.addEventListener("change", () => { settings.autoSync = autoSyncInput.checked; saveSettings(); });
 if (autoRefreshInput) {
   autoRefreshInput.addEventListener("change", () => {
