@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "42";
+const APP_VERSION = "43";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -1351,91 +1351,123 @@ function clockToRailPct(clock) {
 }
 
 /**
- * Layout nodes on the day rail: proportional left%, slight separation for
- * identical/near-identical times, and up/down label lanes so clocks never clip.
+ * Layout proportional rail markers (dots / dense-cluster count bubbles).
+ * HH:MM text never sits on the rail — chips under the rail carry every clock.
  */
 function layoutUseRailNodes(clocks) {
   const list = Array.isArray(clocks) ? clocks.filter(Boolean) : [];
   const n = list.length;
   if (!n) return [];
-  const MIN_SEP = 2.2;
-  const CLOSE = 8.5;
-  const pcts = list.map(clockToRailPct);
-  for (let i = 1; i < n; i++) {
-    if (pcts[i] - pcts[i - 1] < MIN_SEP) {
-      pcts[i] = Math.min(100, pcts[i - 1] + MIN_SEP);
-    }
-  }
-  // If right-edge overflow from nudging, compress slightly from the right.
-  if (pcts[n - 1] > 100) {
-    const overflow = pcts[n - 1] - 100;
-    for (let i = 0; i < n; i++) pcts[i] = Math.max(0, pcts[i] - overflow * (i / (n - 1 || 1)));
-  }
-  const lanes = new Array(n).fill(0);
-  for (let i = 0; i < n; i++) {
-    let lane = i % 2;
-    if (i > 0 && Math.abs(pcts[i] - pcts[i - 1]) < CLOSE) {
-      lane = 1 - lanes[i - 1];
-    }
-    lanes[i] = lane;
-  }
+  const rawPcts = list.map(clockToRailPct);
   const last = n - 1;
-  return list.map((clock, i) => ({
-    clock,
-    pct: pcts[i],
-    lane: lanes[i],
-    latest: i === last,
+  // Merge near-identical times into one rail bubble so dense clusters stay readable.
+  const CLUSTER_GAP = 3.8;
+  const groups = [];
+  for (let i = 0; i < n; i++) {
+    const g = groups[groups.length - 1];
+    if (g && rawPcts[i] - g.pctSum / g.clocks.length < CLUSTER_GAP) {
+      g.clocks.push(list[i]);
+      g.pctSum += rawPcts[i];
+      g.latest = i === last;
+    } else {
+      groups.push({
+        clocks: [list[i]],
+        pctSum: rawPcts[i],
+        latest: i === last,
+      });
+    }
+  }
+  const markers = groups.map(g => ({
+    clocks: g.clocks,
+    count: g.clocks.length,
+    pct: g.pctSum / g.clocks.length,
+    latest: !!g.latest,
+    cluster: g.clocks.length > 1,
   }));
+  // Slight separation so adjacent markers do not fully occlude each other.
+  const MIN_SEP = 2.4;
+  for (let i = 1; i < markers.length; i++) {
+    if (markers[i].pct - markers[i - 1].pct < MIN_SEP) {
+      markers[i].pct = Math.min(100, markers[i - 1].pct + MIN_SEP);
+    }
+  }
+  if (markers.length && markers[markers.length - 1].pct > 100) {
+    const overflow = markers[markers.length - 1].pct - 100;
+    const denom = markers.length - 1 || 1;
+    for (let i = 0; i < markers.length; i++) {
+      markers[i].pct = Math.max(0, markers[i].pct - overflow * (i / denom));
+    }
+  }
+  return markers;
 }
 
 /**
- * Fill one day rail: soft 00→24 track with proportional nodes + HH:MM labels.
- * Count N → N nodes. Empty days keep a muted rail + "No uses".
+ * Fill one day rail: dots (or count bubbles for dense clusters) on the 24h track,
+ * plus a non-overlapping HH:MM chip strip under the rail. Count N → N chips.
  */
 function fillUseCompareRow(rowEl, clocks) {
   if (!rowEl) return;
   const track = rowEl.querySelector(".use-rail-track");
+  const chips = rowEl.querySelector(".use-chips");
   const empty = rowEl.querySelector(".use-times-empty");
   const sr = rowEl.querySelector(".use-rail-sr");
   if (!track || !empty) return;
-  const nodes = layoutUseRailNodes(clocks);
-  const has = nodes.length > 0;
+  const list = Array.isArray(clocks) ? clocks.filter(Boolean) : [];
+  const markers = layoutUseRailNodes(list);
+  const has = list.length > 0;
   empty.classList.toggle("hidden", has);
   empty.textContent = "No uses";
   rowEl.classList.toggle("is-empty", !has);
-  rowEl.setAttribute("data-times", has ? nodes.map(x => x.clock).join(" ") : "");
+  rowEl.setAttribute("data-times", has ? list.join(" ") : "");
   track.replaceChildren();
+  if (chips) chips.replaceChildren();
   if (sr) {
-    sr.textContent = has ? nodes.map(x => x.clock).join(", ") : "No uses";
+    sr.textContent = has ? list.join(", ") : "No uses";
   }
   if (!has) return;
 
-  const frag = document.createDocumentFragment();
-  nodes.forEach((node, i) => {
+  const railFrag = document.createDocumentFragment();
+  markers.forEach((node, i) => {
     const el = document.createElement("div");
     el.className = "use-node"
-      + (node.lane === 1 ? " lane-below" : " lane-above")
+      + (node.cluster ? " is-cluster" : "")
       + (node.latest ? " latest" : "");
     el.style.setProperty("--pct", String(node.pct));
-    el.setAttribute("title", node.latest ? "Latest · " + node.clock : node.clock);
-    el.setAttribute("data-clock", node.clock);
+    el.style.setProperty("--i", String(i));
+    const title = node.cluster
+      ? node.count + " uses · " + node.clocks.join(", ")
+      : (node.latest ? "Latest · " + node.clocks[0] : node.clocks[0]);
+    el.setAttribute("title", title);
+    el.setAttribute("data-clock", node.clocks.join(" "));
+    el.setAttribute("data-count", String(node.count));
 
     const dot = document.createElement("span");
     dot.className = "use-node-dot";
     dot.setAttribute("aria-hidden", "true");
-
-    const time = document.createElement("time");
-    time.className = "use-node-label";
-    time.setAttribute("datetime", node.clock);
-    time.textContent = node.clock;
-
+    if (node.cluster) {
+      const bubble = document.createElement("span");
+      bubble.className = "use-node-count";
+      bubble.textContent = String(node.count);
+      dot.appendChild(bubble);
+    }
     el.appendChild(dot);
-    el.appendChild(time);
-    // Stagger entrance slightly for a calm motion (respect reduced-motion in CSS).
-    el.style.setProperty("--i", String(i));
-    frag.appendChild(el);
+    railFrag.appendChild(el);
   });
-  track.appendChild(frag);
+  track.appendChild(railFrag);
+
+  if (chips) {
+    const chipFrag = document.createDocumentFragment();
+    list.forEach((clock, i) => {
+      const chip = document.createElement("time");
+      chip.className = "use-chip" + (i === list.length - 1 ? " latest" : "");
+      chip.setAttribute("datetime", clock);
+      chip.textContent = clock;
+      chipFrag.appendChild(chip);
+    });
+    chips.appendChild(chipFrag);
+    chips.classList.toggle("hidden", false);
+    chips.setAttribute("aria-label", list.length + (list.length === 1 ? " use time" : " use times"));
+  }
 }
 
 /** Label + count badge for a compare row (e.g. "Today · 6"). */
@@ -1903,6 +1935,7 @@ function renderBadHabitCard(h) {
              </div>
              <span class="use-rail-sr visually-hidden"></span>
            </div>
+           <div class="use-chips" role="list" aria-label="Selected day use times"></div>
          </div>
          <div class="use-times-day" data-role="prev" data-times="">
            <div class="use-times-day-label"></div>
@@ -1913,6 +1946,7 @@ function renderBadHabitCard(h) {
              </div>
              <span class="use-rail-sr visually-hidden"></span>
            </div>
+           <div class="use-chips" role="list" aria-label="Previous day use times"></div>
          </div>
        </div>`
     : "";
