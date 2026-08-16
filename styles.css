@@ -1061,7 +1061,7 @@ body.habit-drag-active * { cursor: grabbing !important; }
 .use-times-day[data-role="prev"] .use-node.is-cluster.latest .use-node-count {
   color: var(--text);
 }
-/* Readable HH:MM row — never overlaps; wraps or scrolls under the rail */
+/* Readable HH:MM chips — wrap to multi rows (no horizontal scroll) */
 .use-chips {
   display: flex;
   flex-wrap: wrap;
@@ -1072,6 +1072,7 @@ body.habit-drag-active * { cursor: grabbing !important; }
   max-width: 100%;
   min-width: 0;
   box-sizing: border-box;
+  overflow-x: visible;
 }
 .use-chips.hidden {
   display: none !important;
@@ -1112,16 +1113,6 @@ body.habit-drag-active * { cursor: grabbing !important; }
   background: #1f2730;
   border-color: rgba(45, 212, 191, 0.35);
   box-shadow: none;
-}
-@media (max-width: 420px) {
-  .use-chips {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    overflow-y: hidden;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: thin;
-    padding-bottom: 4px;
-  }
 }
 .use-times-empty {
   position: absolute;
