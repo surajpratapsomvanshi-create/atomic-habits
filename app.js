@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "43";
+const APP_VERSION = "44";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -67,6 +67,9 @@ function normalizeScriptUrl(raw) {
 /** Default poll interval when auto-refresh is on. */
 const DEFAULT_POLL_MS = 45000;
 const POLL_EDIT_DEBOUNCE_MS = 2500;
+/** Silent merge→upload retries when another phone wrote mid-sync. */
+const SYNC_CONFLICT_MAX_RETRIES = 5;
+const SYNC_CONFLICT_BACKOFF_MS = 400;
 const DEFAULT_LIST_ID = "list-default";
 const DEFAULT_LIST_NAME = "Atomic Habits";
 
@@ -179,6 +182,53 @@ let pollTimer = null;
 let nextPollAt = null;
 /** Last successful cloud pull timestamp. */
 let lastPullAt = null;
+/**
+ * Single-flight sync queue: never overlap upload + poll-save + merge on this device.
+ * Nested calls (resolve inside upload) run inline to avoid deadlock.
+ */
+let syncFlightTail = Promise.resolve();
+let syncFlightDepth = 0;
+let syncFlightKind = null;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms || 0)));
+}
+
+function isSyncWriteInFlight() {
+  return (
+    syncFlightDepth > 0 &&
+    (syncFlightKind === "upload" || syncFlightKind === "resolve" || syncFlightKind === "init")
+  );
+}
+
+/**
+ * Serialize cloud ops. Concurrent callers wait; nested callers run inline.
+ * kind: "upload" | "poll" | "resolve" | "init"
+ */
+function runSyncExclusive(kind, fn) {
+  if (syncFlightDepth > 0) {
+    return Promise.resolve().then(fn);
+  }
+  const run = () => {
+    syncFlightDepth += 1;
+    syncFlightKind = kind;
+    return Promise.resolve()
+      .then(fn)
+      .finally(() => {
+        syncFlightDepth -= 1;
+        if (syncFlightDepth <= 0) {
+          syncFlightDepth = 0;
+          syncFlightKind = null;
+        }
+      });
+  };
+  const p = syncFlightTail.then(run, run);
+  syncFlightTail = p.then(
+    () => {},
+    () => {}
+  );
+  return p;
+}
 
 /* ---------------- persistence ---------------- */
 function load(key, fallback) {
@@ -3075,7 +3125,13 @@ function needsCloudOnboarding(cloud) {
 
 function pollIntervalMs() {
   const n = Number(settings.pollIntervalMs);
-  return n > 0 ? n : DEFAULT_POLL_MS;
+  const base = Number.isFinite(n) && n >= 5000 ? n : DEFAULT_POLL_MS;
+  // Stagger phones on the same sheet so auto-refresh is less lock-step.
+  const id = String((settings && settings.deviceId) || "");
+  let hash = 0;
+  for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) | 0;
+  const jitter = Math.abs(hash) % 8000; // 0–8s
+  return base + jitter;
 }
 
 /** Fetch cloud metadata; falls back to ?action=load for legacy backends. */
@@ -3519,99 +3575,139 @@ async function fetchCloudSnapshot() {
 
 /**
  * Auto-resolve a stale/conflict revision: merge when safe, else pull cloud.
+ * Retries silently when another device writes mid-merge (up to SYNC_CONFLICT_MAX_RETRIES).
  * Never blank-overwrites the Sheet. No force path.
  */
 async function resolveConflictAuto(cloudOrOut, opts) {
   opts = opts || {};
-  setSyncIndicator("pending", "Syncing…");
+  return runSyncExclusive("resolve", () => resolveConflictAutoBody(cloudOrOut, opts));
+}
 
-  // Prefer embedded snapshot from conflict response; otherwise load.
-  let cloudData = cloudOrOut && cloudOrOut.data ? cloudOrOut.data : null;
-  let cloudRev = cloudOrOut && cloudOrOut.revision != null ? cloudOrOut.revision : null;
-  let cloudMeta = cloudOrOut;
-  if (!cloudData) {
-    try {
-      const loaded = await fetchCloudSnapshot();
-      if (!loaded) {
+async function resolveConflictAutoBody(cloudOrOut, opts) {
+  opts = opts || {};
+  let attemptCloud = cloudOrOut;
+  let lastTransportErr = null;
+
+  for (let attempt = 0; attempt < SYNC_CONFLICT_MAX_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const backoff =
+        SYNC_CONFLICT_BACKOFF_MS * attempt + Math.floor(Math.random() * 250);
+      setSyncIndicator("pending", "Syncing…");
+      await sleep(backoff);
+      try {
+        const loaded = await fetchCloudSnapshot();
+        if (loaded && loaded.data) attemptCloud = loaded;
+      } catch (_) {
+        /* keep previous snapshot */
+      }
+    } else {
+      setSyncIndicator("pending", "Syncing…");
+    }
+
+    // Prefer embedded snapshot from conflict response; otherwise load.
+    let cloudData = attemptCloud && attemptCloud.data ? attemptCloud.data : null;
+    let cloudRev = attemptCloud && attemptCloud.revision != null ? attemptCloud.revision : null;
+    let cloudMeta = attemptCloud;
+    if (!cloudData) {
+      try {
+        const loaded = await fetchCloudSnapshot();
+        if (!loaded) {
+          if (attempt < SYNC_CONFLICT_MAX_RETRIES - 1) continue;
+          setSyncIndicator("error", "Can't load cloud to resolve");
+          if (!opts.silent) toast("Can't reach cloud — data is safe locally");
+          return false;
+        }
+        cloudData = loaded.data;
+        cloudRev = loaded.revision;
+        cloudMeta = loaded;
+        attemptCloud = loaded;
+      } catch (err) {
+        lastTransportErr = err;
+        if (attempt < SYNC_CONFLICT_MAX_RETRIES - 1) continue;
         setSyncIndicator("error", "Can't load cloud to resolve");
-        toast("Can't reach cloud — data is safe locally");
+        if (!opts.silent) toast("Can't reach cloud — data is safe locally");
         return false;
       }
-      cloudData = loaded.data;
-      cloudRev = loaded.revision;
-      cloudMeta = loaded;
+    }
+
+    updateSyncSafetyText(cloudMeta);
+
+    // Blank/fresh local or blank-push conflict → prefer cloud, never overwrite.
+    if (isFreshLocal() || (attemptCloud && attemptCloud.reason === "blank") || !dataHasHabits(data)) {
+      rememberRevision(cloudMeta);
+      saveSettings();
+      const ok = await restoreFromSheet({
+        skipConfirm: true,
+        auto: !!opts.auto,
+        fromPoll: !!opts.fromPoll,
+        toastMsg: opts.silent ? null : "Synced",
+      });
+      return ok;
+    }
+
+    const pendingLocal = migrateData(JSON.parse(JSON.stringify(data)));
+    const merged = mergeHabitData(pendingLocal, cloudData);
+
+    if (!merged) {
+      rememberRevision(cloudMeta);
+      saveSettings();
+      const ok = await restoreFromSheet({
+        skipConfirm: true,
+        auto: false,
+        fromPoll: !!opts.fromPoll,
+        toastMsg: opts.silent ? null : "Synced",
+      });
+      return ok;
+    }
+
+    // Apply merge locally, adopt cloud revision as base, then push.
+    makeLocalBackup();
+    data = merged;
+    saveData();
+    if (cloudRev != null) {
+      settings.lastSeenRevision = cloudRev;
+      settings.lastSeenUpdatedAt = (cloudMeta && cloudMeta.updatedAt) || new Date().toISOString();
+    }
+    saveSettings();
+    render();
+
+    let pushed = false;
+    try {
+      pushed = await pushSnapshot({ silent: true, afterMerge: true });
     } catch (err) {
-      setSyncIndicator("error", "Can't load cloud to resolve");
-      toast("Can't reach cloud — data is safe locally");
+      lastTransportErr = err;
+      localDirty = true;
+      autoSyncArmed = true;
+      // Transient transport — retry; only surface after all attempts.
+      if (attempt < SYNC_CONFLICT_MAX_RETRIES - 1) continue;
+      recordSyncError(err, "Merge upload");
+      const msg = humanizeUploadError(err);
+      setSyncIndicator("error", "Merged locally — upload failed: " + msg);
+      if (!opts.silent) toast("Couldn't finish sync — will keep trying (data safe on this phone)");
       return false;
     }
-  }
+    if (pushed) {
+      setSyncIndicator(
+        "ok",
+        "Synced · rev " + (settings.lastSeenRevision != null ? settings.lastSeenRevision : "?")
+      );
+      if (!opts.silent) toast("Synced");
+      return true;
+    }
 
-  updateSyncSafetyText(cloudMeta);
-
-  // Blank/fresh local or blank-push conflict → prefer cloud, never overwrite.
-  if (isFreshLocal() || (cloudOrOut && cloudOrOut.reason === "blank") || !dataHasHabits(data)) {
-    rememberRevision(cloudMeta);
-    saveSettings();
-    const ok = await restoreFromSheet({
-      skipConfirm: true,
-      auto: !!opts.auto,
-      fromPoll: !!opts.fromPoll,
-      toastMsg: "Loaded cloud version",
-    });
-    return ok;
-  }
-
-  const pendingLocal = migrateData(JSON.parse(JSON.stringify(data)));
-  const merged = mergeHabitData(pendingLocal, cloudData);
-
-  if (!merged) {
-    rememberRevision(cloudMeta);
-    saveSettings();
-    const ok = await restoreFromSheet({
-      skipConfirm: true,
-      auto: false,
-      fromPoll: !!opts.fromPoll,
-      toastMsg: "Loaded cloud version",
-    });
-    return ok;
-  }
-
-  // Apply merge locally, adopt cloud revision as base, then push.
-  makeLocalBackup();
-  data = merged;
-  saveData();
-  if (cloudRev != null) {
-    settings.lastSeenRevision = cloudRev;
-    settings.lastSeenUpdatedAt = (cloudMeta && cloudMeta.updatedAt) || new Date().toISOString();
-  }
-  saveSettings();
-  render();
-
-  let pushed = false;
-  try {
-    pushed = await pushSnapshot({ silent: true, afterMerge: true });
-  } catch (err) {
-    // Keep merged local data — never wipe the correct phone after a transport failure.
+    // Concurrent edit during merge push → reload + merge again (silent retry).
     localDirty = true;
     autoSyncArmed = true;
-    recordSyncError(err, "Merge upload");
-    const msg = humanizeUploadError(err);
-    setSyncIndicator("error", "Merged locally — upload failed: " + msg);
-    if (!opts.silent) toast("Merged on this phone — upload retry needed (see Last error)");
-    return false;
-  }
-  if (pushed) {
-    setSyncIndicator("ok", "Merged with cloud · rev " + (settings.lastSeenRevision != null ? settings.lastSeenRevision : "?"));
-    if (!opts.silent) toast("Synced — merged with cloud");
-    return true;
+    attemptCloud = null; // force fresh load on next loop
   }
 
-  // Concurrent edit during merge push → keep merge locally and ask for retry (don't clobber).
-  localDirty = true;
-  autoSyncArmed = true;
-  const conflictMsg = "Cloud changed during merge — tap Upload again (data kept on this phone)";
-  recordSyncError(new Error(conflictMsg), "Merge conflict");
+  // All retries exhausted — data kept locally; avoid scary "tap Upload" wording.
+  const conflictMsg =
+    "Couldn't sync yet — data kept on this phone; tap Upload if it stays out of date";
+  recordSyncError(
+    lastTransportErr || new Error(conflictMsg),
+    lastTransportErr ? "Merge upload" : "Merge conflict"
+  );
   setSyncIndicator("error", conflictMsg);
   if (!opts.silent) toast(conflictMsg);
   return false;
@@ -3622,6 +3718,10 @@ async function resolveConflictAuto(cloudOrOut, opts) {
  * state before auto-sync may fire. New/blank devices auto-restore from cloud.
  */
 async function initSync() {
+  return runSyncExclusive("init", () => initSyncBody());
+}
+
+async function initSyncBody() {
   stopPolling();
   if (!settings.scriptUrl) { autoSyncArmed = true; cloudChecked = true; return; }
   setSyncIndicator("pending", "Checking cloud…");
@@ -3753,8 +3853,8 @@ async function pushSnapshot(opts) {
       throw new Error("Master upload failed — cloud conflict with no revision");
     }
     if (opts.skipResolve || opts.afterMerge) return false;
-    await resolveConflictAuto(out, { silent: opts.silent });
-    return autoSyncArmed && !localDirty;
+    const resolved = await resolveConflictAuto(out, { silent: opts.silent });
+    return !!resolved;
   }
   if (!out || !out.ok) throw new Error((out && out.error) || "Unknown error");
   settings.lastSync = new Date().toISOString();
@@ -3774,6 +3874,10 @@ async function pushSnapshot(opts) {
  * opts.force → master overwrite (skips today-guard; adopts cloud rev as base).
  */
 async function syncNow(opts) {
+  return runSyncExclusive("upload", () => syncNowBody(opts));
+}
+
+async function syncNowBody(opts) {
   opts = opts || {};
   settings.scriptUrl = normalizeScriptUrl(settings.scriptUrl) || settings.scriptUrl;
   if (urlInput) urlInput.value = settings.scriptUrl || urlInput.value;
@@ -3792,7 +3896,7 @@ async function syncNow(opts) {
     updateSyncSafetyText(cloud);
     if (cloud.hasData && !cloudSafeToOverwrite(cloud)) {
       setSyncIndicator("pending", "Syncing…");
-      toast("Syncing…");
+      if (!opts.silent) toast("Syncing…");
       await restoreFromSheet({ skipConfirm: true, auto: true });
       return;
     }
@@ -3830,21 +3934,28 @@ async function syncNow(opts) {
   try {
     const ok = await pushSnapshot({ silent: opts.silent, force: !!opts.force });
     if (!ok) {
-      // Conflict / merge path — not a generic transport failure.
+      // Conflict / merge path — resolveConflictAuto already retried; only toast if still dirty.
+      if (!localDirty && autoSyncArmed) {
+        const rev = settings.lastSeenRevision != null ? " · rev " + settings.lastSeenRevision : "";
+        setSyncIndicator("ok", "Synced" + rev);
+        if (!opts.silent) toast("Synced");
+        return;
+      }
       if (settings.lastSyncError && settings.lastSyncError.message) {
         const raw = settings.lastSyncError.message
           .replace(/^Upload:\s*/i, "")
           .replace(/^Merge upload:\s*/i, "")
           .replace(/^Merge conflict:\s*/i, "");
         setSyncIndicator("error", raw);
-        if (!opts.silent && /conflict|Cloud changed|Replace with cloud|tap Upload again/i.test(raw)) {
-          toast(raw.length > 90 ? "Cloud conflict — tap Upload again (see Last error)" : raw);
+        // Avoid scary mid-merge toasts — resolve already retried; stay quiet when silent.
+        if (!opts.silent && /Couldn't sync|tap Upload|Replace with cloud/i.test(raw)) {
+          toast(raw.length > 100 ? "Couldn't sync yet — data kept on this phone" : raw);
         }
         return;
       }
       const msg = opts.force
         ? "Master upload did not finish — try again"
-        : "Cloud has newer data — tap Upload again to merge (data kept on this phone)";
+        : "Couldn't sync yet — data kept on this phone; tap Upload if needed";
       recordSyncError(new Error(msg), "Upload conflict");
       setSyncIndicator("error", msg);
       if (!opts.silent) toast(msg);
@@ -3852,7 +3963,7 @@ async function syncNow(opts) {
     }
     const rev = settings.lastSeenRevision != null ? " · rev " + settings.lastSeenRevision : "";
     setSyncIndicator("ok", "Uploaded: " + new Date(settings.lastSync).toLocaleString() + rev);
-    if (!opts.silent) toast(settings.lastSeenRevision != null ? "Uploaded to cloud ✓" : "Synced ✓ (legacy backend)");
+    if (!opts.silent) toast(settings.lastSeenRevision != null ? "Synced" : "Synced ✓ (legacy backend)");
   } catch (err) {
     recordSyncError(err, "Upload");
     const nice = humanizeUploadError(err);
@@ -3914,8 +4025,9 @@ async function restoreFromSheet(opts) {
       if (healed) queueHealUpload();
       const rev = out.revision != null ? " · rev " + out.revision : "";
       setSyncIndicator("ok", (opts.auto ? "Loaded from Google Sheet" : "Restored from cloud") + rev);
-      if (opts.toastMsg) toast(opts.toastMsg);
-      else if (opts.auto) toast("Loaded from Google Sheet");
+      if (Object.prototype.hasOwnProperty.call(opts, "toastMsg")) {
+        if (opts.toastMsg) toast(opts.toastMsg);
+      } else if (opts.auto) toast("Loaded from Google Sheet");
       else if (opts.fromPoll) toast("Updated from cloud");
       else toast(backedUp ? "Restored ✓ (local backup saved)" : "Restored from cloud ✓");
       return true;
@@ -3967,8 +4079,24 @@ async function pollCloud(opts) {
       return;
     }
   }
+  // Skip poll while an upload/merge is in flight or a debounced upload is armed.
+  if (!opts.force && (isSyncWriteInFlight() || syncTimer)) {
+    scheduleNextPoll(Math.max(2000, POLL_EDIT_DEBOUNCE_MS));
+    return;
+  }
   if (!autoSyncArmed && settings.lastSeenRevision == null) {
     scheduleNextPoll();
+    return;
+  }
+
+  return runSyncExclusive("poll", () => pollCloudBody(opts));
+}
+
+async function pollCloudBody(opts) {
+  opts = opts || {};
+  // Re-check: an upload may have started while we waited on the flight queue.
+  if (!opts.force && (isSyncWriteInFlight() || syncTimer)) {
+    scheduleNextPoll(Math.max(2000, POLL_EDIT_DEBOUNCE_MS));
     return;
   }
 
@@ -4420,7 +4548,15 @@ initSync();
 try {
   window.__ahSync = {
     pollCloud: (opts) => pollCloud(opts),
-    getPollState: () => ({ pollTimer, nextPollAt, localDirty, autoSyncArmed, lastSeenRevision: settings.lastSeenRevision }),
+    getPollState: () => ({
+      pollTimer,
+      nextPollAt,
+      localDirty,
+      autoSyncArmed,
+      lastSeenRevision: settings.lastSeenRevision,
+      syncFlightDepth,
+      syncFlightKind,
+    }),
     markDirty: () => { localDirty = true; },
     mergeHabitData,
     punchDay,
