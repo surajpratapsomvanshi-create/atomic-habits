@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "45";
+const APP_VERSION = "46";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -3083,21 +3083,11 @@ function setSyncIndicator(state, text) {
     warn: "Sync warn",
     error: "Sync error"
   };
-  const footerLabels = {
-    ok: "● Synced",
-    pending: "● Syncing…",
-    warn: "● Sync warn",
-    error: "● Sync error"
-  };
   const pill = document.getElementById("brand-sync-pill");
   const pillLabel = document.getElementById("brand-sync-label");
-  const footer = document.getElementById("sync-footer");
-  const footerLabel = document.getElementById("sync-footer-label");
   const key = state || "";
   if (pill) pill.className = "status-pill" + (key ? " " + key : "");
   if (pillLabel) pillLabel.textContent = pillLabels[key] || "Cloud ready";
-  if (footer) footer.className = "market-footer" + (key ? " " + key : "");
-  if (footerLabel) footerLabel.textContent = footerLabels[key] || "● Cloud ready";
   updateSyncSafetyText(null);
 }
 

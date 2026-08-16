@@ -26,7 +26,6 @@
   --radius-lg: 16px;
   --nav-h: 60px;
   --fab-size: 56px;
-  --footer-h: 36px;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.5);
   --focus-ring: 0 0 0 3px rgba(45, 212, 191, 0.35);
@@ -79,7 +78,7 @@ body {
 }
 .hidden { display: none !important; }
 .muted { color: var(--muted); font-size: 0.84rem; line-height: 1.5; }
-.center { text-align: center; margin: 16px 0 calc(var(--nav-h) + var(--footer-h) + 16px); }
+.center { text-align: center; margin: 16px 0 calc(var(--nav-h) + 16px); }
 .spacer { flex: 1; }
 
 /* ============ brand bar (TradeDesk Hub–style) ============ */
@@ -194,64 +193,6 @@ body {
   margin-top: 2px;
   color: var(--accent);
   opacity: 0.85;
-}
-
-/* Footer sync strip (MARKET OPEN → SYNCED) */
-.market-footer {
-  position: fixed;
-  bottom: calc(var(--nav-h) + env(safe-area-inset-bottom, 0px));
-  left: 50%;
-  transform: translateX(-50%);
-  width: calc(100% - 24px);
-  max-width: 536px;
-  height: var(--footer-h);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 0 14px;
-  border-radius: 12px 12px 0 0;
-  background: rgba(14, 18, 22, 0.92);
-  border: 1px solid var(--border);
-  border-bottom: none;
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  z-index: 39;
-  font-size: 0.68rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-secondary);
-  box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.25);
-}
-.market-footer .market-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--muted);
-  flex-shrink: 0;
-}
-.market-footer.ok {
-  color: var(--green);
-}
-.market-footer.ok .market-dot {
-  background: var(--green);
-  box-shadow: 0 0 8px rgba(52, 211, 153, 0.7);
-}
-.market-footer.pending,
-.market-footer.warn {
-  color: var(--amber);
-}
-.market-footer.pending .market-dot,
-.market-footer.warn .market-dot {
-  background: var(--amber);
-  box-shadow: 0 0 8px rgba(251, 191, 36, 0.55);
-}
-.market-footer.error {
-  color: var(--red);
-}
-.market-footer.error .market-dot {
-  background: var(--red);
 }
 
 /* ============ top band (tabs + thin progress) ============ */
@@ -556,10 +497,10 @@ body {
 .view {
   display: none;
   flex: 1;
-  padding: 0 12px calc(var(--nav-h) + var(--footer-h) + var(--fab-size) + 28px);
+  padding: 0 12px calc(var(--nav-h) + var(--fab-size) + 28px);
 }
 #view-settings.view {
-  padding-bottom: calc(var(--nav-h) + var(--footer-h) + 28px);
+  padding-bottom: calc(var(--nav-h) + 28px);
 }
 .view.active { display: block; animation: viewIn 0.24s cubic-bezier(0.22, 1, 0.36, 1); }
 @keyframes viewIn {
@@ -2031,7 +1972,7 @@ input.input-error {
 .fab {
   position: fixed;
   right: max(16px, calc(50% - 264px));
-  bottom: calc(var(--nav-h) + var(--footer-h) + env(safe-area-inset-bottom, 0px) + 12px);
+  bottom: calc(var(--nav-h) + env(safe-area-inset-bottom, 0px) + 12px);
   width: var(--fab-size);
   height: var(--fab-size);
   border-radius: 16px;
@@ -2191,7 +2132,7 @@ input.input-error {
 /* ============ toast ============ */
 .toast {
   position: fixed;
-  bottom: calc(var(--nav-h) + var(--footer-h) + var(--fab-size) + 22px);
+  bottom: calc(var(--nav-h) + var(--fab-size) + 22px);
   left: 50%;
   transform: translateX(-50%);
   background: var(--surface-3);
