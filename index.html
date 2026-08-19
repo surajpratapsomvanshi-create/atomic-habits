@@ -133,7 +133,9 @@
           <div><span class="sync-rev-label">Last error</span> <strong id="sync-last-error">None</strong></div>
         </div>
         <label class="field-label" for="script-url">Web App URL</label>
-        <input type="url" id="script-url" placeholder="https://script.google.com/macros/s/…/exec" value="https://script.google.com/macros/s/AKfycbxxcZhrVNYDpg4ZUfFQNDGudJKUJENaQRRcoyMio8_YEdo5GoKscHAGyUhEd0iK9NkG/exec" />
+        <input type="url" id="script-url" spellcheck="false" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec" value="https://script.google.com/macros/s/AKfycbxxcZhrVNYDpg4ZUfFQNDGudJKUJENaQRRcoyMio8_YEdo5GoKscHAGyUhEd0iK9NkG/exec" />
+        <p class="field-hint" id="script-url-hint">Full URL from Apps Script → Deploy → Web app (must end with <b>/exec</b>). Scroll the field sideways to see the whole link.</p>
+        <p class="field-error" id="script-url-error" hidden></p>
         <div class="btn-row">
           <button class="btn btn-ghost" type="button" id="btn-retry-connection">Retry connection</button>
         </div>

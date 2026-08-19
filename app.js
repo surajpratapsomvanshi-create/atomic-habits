@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "46";
+const APP_VERSION = "47";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -61,6 +61,62 @@ function normalizeScriptUrl(raw) {
       return u.replace(/\/+$/, "") + "/exec";
     }
     return u;
+  }
+}
+
+/** Full Apps Script web-app URL: long deployment id + /exec (truncated ids 404). */
+const SCRIPT_URL_RE =
+  /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]{25,}\/exec$/i;
+
+function isValidScriptUrl(raw) {
+  const u = String(raw || "").trim();
+  return !!u && SCRIPT_URL_RE.test(u);
+}
+
+/** Google 404 / Drive HTML instead of JSON — wrong or truncated Web App URL. */
+function isHtmlErrorBody(text) {
+  const t = String(text || "").trim().slice(0, 800).toLowerCase();
+  return (
+    t.startsWith("<!doctype") ||
+    t.startsWith("<html") ||
+    /page not found|unable to open the file|docs\.google\.com\/favicon/i.test(t)
+  );
+}
+
+/**
+ * Normalize stored URL; if incomplete/truncated, restore DEFAULT_SCRIPT_URL.
+ * Returns { url, repaired, previous, message }.
+ */
+function repairScriptUrl() {
+  const previous = settings.scriptUrl || "";
+  const normalized = normalizeScriptUrl(previous);
+  if (isValidScriptUrl(normalized)) {
+    if (normalized !== previous) {
+      settings.scriptUrl = normalized;
+      saveSettings();
+    }
+    return { url: normalized, repaired: false, previous, message: "" };
+  }
+  settings.scriptUrl = DEFAULT_SCRIPT_URL;
+  saveSettings();
+  const message =
+    "Web App URL was incomplete or invalid — restored default. Paste the full /exec URL from Apps Script → Deploy if yours differs.";
+  return { url: DEFAULT_SCRIPT_URL, repaired: true, previous, message };
+}
+
+function showScriptUrlFieldState(opts) {
+  opts = opts || {};
+  const errEl = document.getElementById("script-url-error");
+  if (!urlInput) return;
+  if (opts.error) {
+    urlInput.classList.add("input-error");
+    if (errEl) {
+      errEl.hidden = false;
+      errEl.textContent = opts.error;
+    }
+  } else {
+    urlInput.classList.remove("input-error");
+    if (errEl) errEl.hidden = true;
   }
 }
 
@@ -263,11 +319,16 @@ function loadSettings() {
     dirty = true;
   } else {
     const normalized = normalizeScriptUrl(merged.scriptUrl);
-    if (normalized && normalized !== merged.scriptUrl) {
-      merged.scriptUrl = normalized;
+    if (isValidScriptUrl(normalized)) {
+      if (normalized !== merged.scriptUrl) {
+        merged.scriptUrl = normalized;
+        dirty = true;
+      } else {
+        merged.scriptUrl = normalized;
+      }
+    } else {
+      merged.scriptUrl = DEFAULT_SCRIPT_URL;
       dirty = true;
-    } else if (normalized) {
-      merged.scriptUrl = normalized;
     }
   }
   if (!merged.deviceId) {
@@ -2722,12 +2783,16 @@ function gasJsonGet(url) {
           reject(new Error("Empty response from cloud"));
           return;
         }
+        if (isHtmlErrorBody(text)) {
+          reject(gasHtmlResponseError(xhr.status, text));
+          return;
+        }
         try { resolve(JSON.parse(text)); }
         catch (_) {
           reject(new GasHttpError(xhr.status, "invalid JSON: " + String(text).slice(0, 120)));
         }
       } else {
-        reject(new GasHttpError(xhr.status, text));
+        reject(gasHtmlResponseError(xhr.status, text));
       }
     };
     xhr.onerror = function () {
@@ -2757,10 +2822,14 @@ function gasPostJson(url, payload) {
           reject(new Error("Empty response on upload"));
           return;
         }
+        if (isHtmlErrorBody(text)) {
+          reject(gasHtmlResponseError(xhr.status, text));
+          return;
+        }
         try { resolve(JSON.parse(text)); }
         catch (_) { reject(new GasHttpError(xhr.status, "invalid JSON: " + String(text).slice(0, 120))); }
       } else {
-        reject(new GasHttpError(xhr.status, text));
+        reject(gasHtmlResponseError(xhr.status, text));
       }
     };
     xhr.onerror = function () {
@@ -2791,10 +2860,14 @@ function gasPostForm(url, payload) {
           reject(new Error("Empty response on form upload"));
           return;
         }
+        if (isHtmlErrorBody(text)) {
+          reject(gasHtmlResponseError(xhr.status, text));
+          return;
+        }
         try { resolve(JSON.parse(text)); }
         catch (_) { reject(new GasHttpError(xhr.status, "invalid JSON: " + String(text).slice(0, 120))); }
       } else {
-        reject(new GasHttpError(xhr.status, text));
+        reject(gasHtmlResponseError(xhr.status, text));
       }
     };
     xhr.onerror = function () {
@@ -2803,6 +2876,18 @@ function gasPostForm(url, payload) {
     xhr.ontimeout = function () { reject(new Error("Form upload timed out (120s)")); };
     xhr.send(body);
   });
+}
+
+/** Map HTML/Google 404 bodies to a clear Settings message (not a raw HTML dump). */
+function gasHtmlResponseError(status, text) {
+  const code = status != null ? status : 0;
+  if (code === 404 || isHtmlErrorBody(text)) {
+    return new GasHttpError(
+      code,
+      "Web App URL wrong or deployment removed — paste the full /exec URL from Apps Script → Deploy → Web app"
+    );
+  }
+  return new GasHttpError(code, String(text || "").slice(0, 160));
 }
 
 /**
@@ -2826,11 +2911,14 @@ function humanizeUploadError(err) {
   if (status === 414 || /too large|URI Too Long|Chunk URL/i.test(msg)) {
     return "Upload too large for GET fallback — retry on Wi‑Fi; if it persists update the app";
   }
-  if (status === 404 || status === 405 || status === 411) {
+  if (status === 404 || /Web App URL wrong|deployment removed|full \/exec URL/i.test(msg)) {
+    return "Web App URL wrong or deployment removed — paste the full /exec URL from Apps Script → Deploy";
+  }
+  if (status === 405 || status === 411) {
     return "Upload blocked by Apps Script redirect (HTTP " + status + ") — retry; redeploy backend if it persists";
   }
-  if (/invalid JSON|Empty response/i.test(msg)) {
-    return "Cloud returned a bad upload response (redirect/HTML) — retry; if it persists redeploy backend";
+  if (/invalid JSON|Empty response|HTML instead of JSON/i.test(msg)) {
+    return "Cloud returned HTML instead of JSON — check Web App URL; paste full /exec URL";
   }
   if (/Network error|Failed to fetch|Load failed|status\":\s*0|HTTP 0/i.test(msg)) {
     return "Network error on upload — check connection; tap Retry connection; Settings → Last error for details";
@@ -2851,7 +2939,9 @@ function formatSyncErrorDetail(err) {
   const msg = err && err.message ? String(err.message) : String(err || "Unknown error");
   bits.push(msg);
   if (err && err.snippet) {
-    const snip = String(err.snippet).replace(/\s+/g, " ").trim().slice(0, 160);
+    const snip = isHtmlErrorBody(err.snippet)
+      ? "(Google HTML page — URL likely truncated or deployment removed)"
+      : String(err.snippet).replace(/\s+/g, " ").trim().slice(0, 160);
     if (snip && msg.indexOf(snip) < 0) bits.push(snip);
   }
   return bits.join(" | ").slice(0, 500);
@@ -3713,6 +3803,15 @@ async function initSync() {
 
 async function initSyncBody() {
   stopPolling();
+  const urlFix = repairScriptUrl();
+  if (urlInput) urlInput.value = settings.scriptUrl;
+  if (urlFix.repaired) {
+    showScriptUrlFieldState({ error: urlFix.message });
+    toast(urlFix.message);
+    recordSyncError(new Error(urlFix.message), "URL repaired");
+  } else {
+    showScriptUrlFieldState({});
+  }
   if (!settings.scriptUrl) { autoSyncArmed = true; cloudChecked = true; return; }
   setSyncIndicator("pending", "Checking cloud…");
   let cloud;
@@ -4334,9 +4433,20 @@ if (pollIntervalInput) {
 
 /** Apply + normalize Web App URL from the Settings field (ensures …/exec). */
 function applyScriptUrlFromInput() {
-  const normalized = normalizeScriptUrl(urlInput.value) || DEFAULT_SCRIPT_URL;
+  const normalized = normalizeScriptUrl(urlInput.value);
+  if (!isValidScriptUrl(normalized)) {
+    const fix = repairScriptUrl();
+    urlInput.value = fix.url;
+    showScriptUrlFieldState({
+      error:
+        "URL incomplete — paste the full link from Apps Script Deploy (ends with /exec). Restored default.",
+    });
+    toast(fix.message || "Web App URL incomplete — restored default");
+    return fix.url;
+  }
   settings.scriptUrl = normalized;
   urlInput.value = normalized;
+  showScriptUrlFieldState({});
   saveSettings();
   return normalized;
 }

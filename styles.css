@@ -1811,6 +1811,15 @@ select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
+#script-url {
+  font-size: 0.76rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-x: auto;
+  text-overflow: clip;
+  word-break: break-all;
+  min-width: 0;
+  max-width: 100%;
+}
 .field-hint {
   color: var(--muted);
   font-size: 0.72rem;
