@@ -27,7 +27,7 @@ const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "47";
+const APP_VERSION = "48";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -126,6 +126,15 @@ const POLL_EDIT_DEBOUNCE_MS = 2500;
 /** Silent merge→upload retries when another phone wrote mid-sync. */
 const SYNC_CONFLICT_MAX_RETRIES = 5;
 const SYNC_CONFLICT_BACKOFF_MS = 400;
+/** Debounce local edits → upload; longer after recent network/HTTP 0 failures. */
+const SYNC_DEBOUNCE_MS = 2500;
+const SYNC_DEBOUNCE_NETERR_MS = 10000;
+const SYNC_NETERR_WINDOW_MS = 90000;
+/** GAS XHR: longer timeout + retries (mobile often gets status 0 on first hop). */
+const GAS_XHR_TIMEOUT_MS = 180000;
+const GAS_GET_MAX_ATTEMPTS = 3;
+const GAS_POST_MAX_ATTEMPTS = 2;
+const GAS_RETRY_BASE_MS = 600;
 const DEFAULT_LIST_ID = "list-default";
 const DEFAULT_LIST_NAME = "Atomic Habits";
 
@@ -224,6 +233,8 @@ let modalListId = null;
 /** Bad-habit Stats compare mode: full-day average vs pace-until-now. */
 let counterPaceMode = "full"; // "full" | "until"
 let syncTimer = null;
+/** Last time a GAS call failed with HTTP 0 / offline — slows merge-upload flood. */
+let lastNetworkFailAt = 0;
 /** Auto-sync stays disarmed until cloud state is loaded or confirmed empty. */
 let autoSyncArmed = false;
 /** True once initSync has finished its first cloud check. */
@@ -245,9 +256,76 @@ let lastPullAt = null;
 let syncFlightTail = Promise.resolve();
 let syncFlightDepth = 0;
 let syncFlightKind = null;
+/**
+ * Serialize every Apps Script XHR. Concurrent GETs+POSTs on Android often
+ * surface as HTTP 0 (connection dropped mid redirect) — never abort mid-flight.
+ * Nested calls (POST falling back to GET save) run inline to avoid deadlock.
+ */
+let gasXhrTail = Promise.resolve();
+let gasXhrDepth = 0;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms || 0)));
+}
+
+function enqueueGasXhr(fn) {
+  if (gasXhrDepth > 0) {
+    return Promise.resolve().then(fn);
+  }
+  const run = function () {
+    gasXhrDepth += 1;
+    return Promise.resolve()
+      .then(fn)
+      .finally(function () {
+        gasXhrDepth -= 1;
+        if (gasXhrDepth < 0) gasXhrDepth = 0;
+      });
+  };
+  const p = gasXhrTail.then(run, run);
+  gasXhrTail = p.then(
+    function () {},
+    function () {}
+  );
+  return p;
+}
+
+function isDeviceOffline() {
+  return typeof navigator !== "undefined" && navigator.onLine === false;
+}
+
+function noteNetworkFail(err) {
+  const status = err && err.status;
+  const msg = err && err.message ? String(err.message) : String(err || "");
+  if (
+    status === 0 ||
+    /Network error|Failed to fetch|Load failed|can't reach cloud|Device offline/i.test(msg)
+  ) {
+    lastNetworkFailAt = Date.now();
+  }
+}
+
+function syncDebounceMs() {
+  if (lastNetworkFailAt && Date.now() - lastNetworkFailAt < SYNC_NETERR_WINDOW_MS) {
+    return SYNC_DEBOUNCE_NETERR_MS;
+  }
+  return SYNC_DEBOUNCE_MS;
+}
+
+function gasHttp0Message(method) {
+  if (isDeviceOffline()) {
+    return "Device offline — turn on Wi‑Fi/mobile data, then tap Retry connection";
+  }
+  return (
+    "Network error — can't reach cloud (" + method +
+    "; phone reports online but request failed — try Wi‑Fi, disable Private DNS/Data Saver, open test URL in Chrome)"
+  );
+}
+
+function isTransientGasErr(err) {
+  if (!err) return false;
+  if (err.status === 0) return true;
+  const msg = err.message ? String(err.message) : String(err);
+  return /Network error|Failed to fetch|Load failed|timed out|Device offline/i.test(msg);
 }
 
 function isSyncWriteInFlight() {
@@ -2769,13 +2847,23 @@ function sleepMs(ms) {
  * fetch() on mobile Chrome/PWA throws "Failed to fetch" on GAS's
  * script.google.com → script.googleusercontent.com redirect, or else
  * returns the bare /exec "backend is running" body instead of JSON.
+ * Concurrent XHRs are serialized (enqueueGasXhr) so merge never aborts an
+ * in-flight info/load — overlapping requests often show up as HTTP 0 on Android.
  */
-function gasJsonGet(url) {
+function gasJsonGetOnce(url, opts) {
+  opts = opts || {};
   return new Promise(function (resolve, reject) {
+    if (isDeviceOffline()) {
+      reject(new GasHttpError(0, gasHttp0Message("XHR GET")));
+      return;
+    }
     const xhr = new XMLHttpRequest();
     xhr.open("GET", url, true);
-    xhr.timeout = 120000;
+    xhr.timeout = opts.timeoutMs != null ? opts.timeoutMs : GAS_XHR_TIMEOUT_MS;
     xhr.withCredentials = false;
+    if (opts.accept) {
+      try { xhr.setRequestHeader("Accept", opts.accept); } catch (_) { /* ignore */ }
+    }
     xhr.onload = function () {
       const text = xhr.responseText || "";
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -2796,10 +2884,48 @@ function gasJsonGet(url) {
       }
     };
     xhr.onerror = function () {
-      reject(new GasHttpError(0, "Network error — can't reach cloud (XHR GET)"));
+      reject(new GasHttpError(0, gasHttp0Message("XHR GET")));
     };
-    xhr.ontimeout = function () { reject(new Error("Cloud GET timed out (120s)")); };
+    xhr.ontimeout = function () {
+      reject(new Error("Cloud GET timed out (" + Math.round(xhr.timeout / 1000) + "s)"));
+    };
     xhr.send();
+  });
+}
+
+/** Cache-bust + Accept variants when the first XHR dies with status 0. */
+function gasGetAttemptUrls(url, attempt) {
+  const sep = url.indexOf("?") >= 0 ? "&" : "?";
+  const bust = url + sep + "_ah=" + Date.now().toString(36) + "r" + attempt;
+  if (attempt === 0) {
+    return [{ url: url }, { url: bust }];
+  }
+  return [
+    { url: bust },
+    { url: bust, accept: "application/json, text/plain, */*" },
+    { url: url, accept: "*/*" },
+  ];
+}
+
+function gasJsonGet(url) {
+  return enqueueGasXhr(async function () {
+    let lastErr = null;
+    for (let attempt = 0; attempt < GAS_GET_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) await sleepMs(GAS_RETRY_BASE_MS * Math.pow(2, attempt - 1));
+      const variants = gasGetAttemptUrls(url, attempt);
+      for (let v = 0; v < variants.length; v++) {
+        try {
+          const out = await gasJsonGetOnce(variants[v].url, { accept: variants[v].accept });
+          lastNetworkFailAt = 0;
+          return out;
+        } catch (err) {
+          lastErr = err;
+          if (!isTransientGasErr(err)) throw err;
+        }
+      }
+    }
+    noteNetworkFail(lastErr);
+    throw lastErr || new GasHttpError(0, gasHttp0Message("XHR GET"));
   });
 }
 
@@ -2807,13 +2933,16 @@ function gasJsonGet(url) {
  * POST via XMLHttpRequest — Google Apps Script redirects POST and fetch()
  * often turns it into a broken GET (404/411). XHR survives the redirect on mobile.
  */
-function gasPostJson(url, payload) {
-  const body = JSON.stringify(payload);
+function gasPostJsonOnce(url, body) {
   return new Promise(function (resolve, reject) {
+    if (isDeviceOffline()) {
+      reject(new GasHttpError(0, gasHttp0Message("XHR POST")));
+      return;
+    }
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url, true);
     xhr.setRequestHeader("Content-Type", "text/plain;charset=utf-8");
-    xhr.timeout = 120000;
+    xhr.timeout = GAS_XHR_TIMEOUT_MS;
     xhr.withCredentials = false;
     xhr.onload = function () {
       const text = xhr.responseText || "";
@@ -2833,10 +2962,32 @@ function gasPostJson(url, payload) {
       }
     };
     xhr.onerror = function () {
-      reject(new GasHttpError(0, "Network error — can't reach cloud (XHR POST)"));
+      reject(new GasHttpError(0, gasHttp0Message("XHR POST")));
     };
-    xhr.ontimeout = function () { reject(new Error("Upload timed out (120s)")); };
+    xhr.ontimeout = function () {
+      reject(new Error("Upload timed out (" + Math.round(xhr.timeout / 1000) + "s)"));
+    };
     xhr.send(body);
+  });
+}
+
+function gasPostJson(url, payload) {
+  const body = JSON.stringify(payload);
+  return enqueueGasXhr(async function () {
+    let lastErr = null;
+    for (let attempt = 0; attempt < GAS_POST_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) await sleepMs(GAS_RETRY_BASE_MS * Math.pow(2, attempt - 1));
+      try {
+        const out = await gasPostJsonOnce(url, body);
+        lastNetworkFailAt = 0;
+        return out;
+      } catch (err) {
+        lastErr = err;
+        if (!isTransientGasErr(err)) throw err;
+      }
+    }
+    noteNetworkFail(lastErr);
+    throw lastErr || new GasHttpError(0, gasHttp0Message("XHR POST"));
   });
 }
 
@@ -2844,14 +2995,16 @@ function gasPostJson(url, payload) {
  * Form-urlencoded POST with payload=base64(JSON). Works when text/plain POST
  * is stripped by a redirect but a form body still reaches Apps Script.
  */
-function gasPostForm(url, payload) {
-  const b64 = utf8ToBase64(JSON.stringify(payload));
-  const body = "payload=" + encodeURIComponent(b64);
+function gasPostFormOnce(url, body) {
   return new Promise(function (resolve, reject) {
+    if (isDeviceOffline()) {
+      reject(new GasHttpError(0, gasHttp0Message("form POST")));
+      return;
+    }
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url, true);
     xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded;charset=utf-8");
-    xhr.timeout = 120000;
+    xhr.timeout = GAS_XHR_TIMEOUT_MS;
     xhr.withCredentials = false;
     xhr.onload = function () {
       const text = xhr.responseText || "";
@@ -2871,10 +3024,33 @@ function gasPostForm(url, payload) {
       }
     };
     xhr.onerror = function () {
-      reject(new GasHttpError(0, "Network error — can't reach cloud (form POST)"));
+      reject(new GasHttpError(0, gasHttp0Message("form POST")));
     };
-    xhr.ontimeout = function () { reject(new Error("Form upload timed out (120s)")); };
+    xhr.ontimeout = function () {
+      reject(new Error("Form upload timed out (" + Math.round(xhr.timeout / 1000) + "s)"));
+    };
     xhr.send(body);
+  });
+}
+
+function gasPostForm(url, payload) {
+  const b64 = utf8ToBase64(JSON.stringify(payload));
+  const body = "payload=" + encodeURIComponent(b64);
+  return enqueueGasXhr(async function () {
+    let lastErr = null;
+    for (let attempt = 0; attempt < GAS_POST_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) await sleepMs(GAS_RETRY_BASE_MS * Math.pow(2, attempt - 1));
+      try {
+        const out = await gasPostFormOnce(url, body);
+        lastNetworkFailAt = 0;
+        return out;
+      } catch (err) {
+        lastErr = err;
+        if (!isTransientGasErr(err)) throw err;
+      }
+    }
+    noteNetworkFail(lastErr);
+    throw lastErr || new GasHttpError(0, gasHttp0Message("form POST"));
   });
 }
 
@@ -2920,8 +3096,11 @@ function humanizeUploadError(err) {
   if (/invalid JSON|Empty response|HTML instead of JSON/i.test(msg)) {
     return "Cloud returned HTML instead of JSON — check Web App URL; paste full /exec URL";
   }
-  if (/Network error|Failed to fetch|Load failed|status\":\s*0|HTTP 0/i.test(msg)) {
-    return "Network error on upload — check connection; tap Retry connection; Settings → Last error for details";
+  if (/Network error|Failed to fetch|Load failed|status\":\s*0|HTTP 0|Device offline|can't reach cloud/i.test(msg)) {
+    if (isDeviceOffline() || /Device offline/i.test(msg)) {
+      return "Phone is offline — turn on Wi‑Fi/data, then tap Retry connection";
+    }
+    return "Cloud briefly unreachable (HTTP 0) — phone online but request failed; try Wi‑Fi, disable Private DNS/Data Saver, tap Retry connection; open test URL in Chrome if it persists";
   }
   if (/timed out/i.test(msg)) {
     return "Upload timed out — try again on Wi‑Fi";
@@ -3002,11 +3181,11 @@ function assertSaveTransportResult(out, via) {
   );
 }
 
-/** One chunk GET with retries — XHR only (never fetch; mobile Failed to fetch on GAS redirects). */
+/** One chunk GET — retries live inside gasJsonGet (avoid nested 3×3 storms). */
 async function gasGetSaveOnce(url) {
   let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) await sleepMs(200 * attempt);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await sleepMs(250 * attempt);
     try {
       const out = await gasJsonGet(url);
       if (isNoopBackendResponse(out) && !out.waiting && !out.conflict) {
@@ -3016,6 +3195,7 @@ async function gasGetSaveOnce(url) {
       return out;
     } catch (err) {
       lastErr = err;
+      if (!isTransientGasErr(err)) throw err;
     }
   }
   throw lastErr || new Error("GET save failed");
@@ -3131,6 +3311,7 @@ function recordSyncSuccess(kind) {
 }
 
 function recordSyncError(err, context) {
+  noteNetworkFail(err);
   const detail = formatSyncErrorDetail(err);
   const msg = (context ? context + ": " : "") + detail;
   settings.lastSyncError = { at: new Date().toISOString(), message: msg };
@@ -3882,7 +4063,8 @@ function queueSync() {
   if (!autoSyncArmed) return; // never auto-push before cloud state is known
   setSyncIndicator("pending");
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => { syncTimer = null; syncNow(); }, 2500);
+  // Longer debounce after HTTP 0 / offline so merge-upload does not flood.
+  syncTimer = setTimeout(() => { syncTimer = null; syncNow(); }, syncDebounceMs());
 }
 
 /**
