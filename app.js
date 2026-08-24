@@ -25,9 +25,11 @@
 const LS_DATA = "ah.data";
 const LS_SETTINGS = "ah.settings";
 const LS_APP_VERSION = "ah.appVersion";
+/** Durable outbox: pending uploads survive reloads until cloud ACK. */
+const LS_SYNC_OUTBOX = "ah.syncOutbox";
 
 /** Visible app build — bump with every Pages deploy / SW cache bust. */
-const APP_VERSION = "47";
+const APP_VERSION = "49";
 
 /** Default Google Apps Script Web App URL (Atomic Habits backend). */
 const DEFAULT_SCRIPT_URL =
@@ -126,6 +128,23 @@ const POLL_EDIT_DEBOUNCE_MS = 2500;
 /** Silent merge→upload retries when another phone wrote mid-sync. */
 const SYNC_CONFLICT_MAX_RETRIES = 5;
 const SYNC_CONFLICT_BACKOFF_MS = 400;
+/** Debounce local edits → upload; longer after recent network/HTTP 0 failures. */
+const SYNC_DEBOUNCE_MS = 2500;
+const SYNC_DEBOUNCE_NETERR_MS = 10000;
+const SYNC_NETERR_WINDOW_MS = 90000;
+/**
+ * Durable background sync: exponential backoff until cloud ACK.
+ * Settings → Last error only after persistent failure (attempts OR wall time).
+ */
+const SYNC_RETRY_MIN_MS = 2000;
+const SYNC_RETRY_MAX_MS = 5 * 60 * 1000;
+const SYNC_PERSIST_FAIL_ATTEMPTS = 10;
+const SYNC_PERSIST_FAIL_MS = 10 * 60 * 1000;
+/** GAS XHR: longer timeout + retries (mobile often gets status 0 on first hop). */
+const GAS_XHR_TIMEOUT_MS = 180000;
+const GAS_GET_MAX_ATTEMPTS = 4;
+const GAS_POST_MAX_ATTEMPTS = 3;
+const GAS_RETRY_BASE_MS = 700;
 const DEFAULT_LIST_ID = "list-default";
 const DEFAULT_LIST_NAME = "Atomic Habits";
 
@@ -224,6 +243,11 @@ let modalListId = null;
 /** Bad-habit Stats compare mode: full-day average vs pace-until-now. */
 let counterPaceMode = "full"; // "full" | "until"
 let syncTimer = null;
+/** Last time a GAS call failed with HTTP 0 / offline — slows merge-upload flood. */
+let lastNetworkFailAt = 0;
+/** Background durable-sync worker (retries until cloud ACK). */
+let durableSyncTimer = null;
+let durableWorkerRunning = false;
 /** Auto-sync stays disarmed until cloud state is loaded or confirmed empty. */
 let autoSyncArmed = false;
 /** True once initSync has finished its first cloud check. */
@@ -245,9 +269,288 @@ let lastPullAt = null;
 let syncFlightTail = Promise.resolve();
 let syncFlightDepth = 0;
 let syncFlightKind = null;
+/**
+ * Serialize every Apps Script XHR. Concurrent GETs+POSTs on Android often
+ * surface as HTTP 0 (connection dropped mid redirect) — never abort mid-flight.
+ * Nested calls (POST falling back to GET save) run inline to avoid deadlock.
+ */
+let gasXhrTail = Promise.resolve();
+let gasXhrDepth = 0;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms || 0)));
+}
+
+function enqueueGasXhr(fn) {
+  if (gasXhrDepth > 0) {
+    return Promise.resolve().then(fn);
+  }
+  const run = function () {
+    gasXhrDepth += 1;
+    return Promise.resolve()
+      .then(fn)
+      .finally(function () {
+        gasXhrDepth -= 1;
+        if (gasXhrDepth < 0) gasXhrDepth = 0;
+      });
+  };
+  const p = gasXhrTail.then(run, run);
+  gasXhrTail = p.then(
+    function () {},
+    function () {}
+  );
+  return p;
+}
+
+function isDeviceOffline() {
+  return typeof navigator !== "undefined" && navigator.onLine === false;
+}
+
+function noteNetworkFail(err) {
+  const status = err && err.status;
+  const msg = err && err.message ? String(err.message) : String(err || "");
+  if (
+    status === 0 ||
+    /Network error|Failed to fetch|Load failed|can't reach cloud|Device offline/i.test(msg)
+  ) {
+    lastNetworkFailAt = Date.now();
+  }
+}
+
+function syncDebounceMs() {
+  if (lastNetworkFailAt && Date.now() - lastNetworkFailAt < SYNC_NETERR_WINDOW_MS) {
+    return SYNC_DEBOUNCE_NETERR_MS;
+  }
+  return SYNC_DEBOUNCE_MS;
+}
+
+function gasHttp0Message(method) {
+  if (isDeviceOffline()) {
+    return "Device offline — turn on Wi‑Fi/mobile data, then tap Retry connection";
+  }
+  return (
+    "Network error — can't reach cloud (" + method +
+    "; phone reports online but request failed — try Wi‑Fi, disable Private DNS/Data Saver, open test URL in Chrome)"
+  );
+}
+
+function isTransientGasErr(err) {
+  if (!err) return false;
+  if (err.status === 0) return true;
+  const msg = err.message ? String(err.message) : String(err);
+  return /Network error|Failed to fetch|Load failed|timed out|Device offline|Empty response|noop backend|incomplete — redirect/i.test(msg);
+}
+
+/** True when sync transport should wait (tab hidden or device offline). */
+function isSyncTransportPaused() {
+  if (typeof document !== "undefined" && document.hidden) return true;
+  if (isDeviceOffline()) return true;
+  return false;
+}
+
+function defaultSyncOutbox() {
+  return {
+    dirty: false,
+    attempts: 0,
+    firstFailAt: null,
+    lastFailAt: null,
+    nextRetryAt: null,
+    lastError: null,
+  };
+}
+
+function loadSyncOutbox() {
+  try {
+    const raw = localStorage.getItem(LS_SYNC_OUTBOX);
+    if (!raw) return defaultSyncOutbox();
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return defaultSyncOutbox();
+    return Object.assign(defaultSyncOutbox(), parsed);
+  } catch (_) {
+    return defaultSyncOutbox();
+  }
+}
+
+function saveSyncOutbox() {
+  try {
+    localStorage.setItem(LS_SYNC_OUTBOX, JSON.stringify(syncOutbox));
+  } catch (_) { /* ignore quota */ }
+}
+
+let syncOutbox = loadSyncOutbox();
+if (syncOutbox.dirty) localDirty = true;
+
+function markOutboxDirty() {
+  syncOutbox.dirty = true;
+  saveSyncOutbox();
+}
+
+function clearSyncOutbox() {
+  syncOutbox = defaultSyncOutbox();
+  saveSyncOutbox();
+}
+
+function isPersistentSyncFailure() {
+  if (!syncOutbox || !syncOutbox.dirty) return false;
+  if ((syncOutbox.attempts || 0) >= SYNC_PERSIST_FAIL_ATTEMPTS) return true;
+  if (syncOutbox.firstFailAt && Date.now() - syncOutbox.firstFailAt >= SYNC_PERSIST_FAIL_MS) {
+    return true;
+  }
+  return false;
+}
+
+function syncRetryDelayMs(attempt) {
+  const n = Math.max(0, Number(attempt) || 0);
+  const exp = Math.min(SYNC_RETRY_MAX_MS, SYNC_RETRY_MIN_MS * Math.pow(2, Math.min(n, 8)));
+  const jitter = Math.floor(Math.random() * 400);
+  return Math.min(SYNC_RETRY_MAX_MS, exp + jitter);
+}
+
+/** Record a failed background attempt; schedules the next durable retry. */
+function noteOutboxFail(err) {
+  noteNetworkFail(err);
+  syncOutbox.dirty = true;
+  syncOutbox.attempts = (syncOutbox.attempts || 0) + 1;
+  syncOutbox.lastFailAt = Date.now();
+  if (!syncOutbox.firstFailAt) syncOutbox.firstFailAt = Date.now();
+  syncOutbox.lastError = formatSyncErrorDetail(err);
+  syncOutbox.nextRetryAt = Date.now() + syncRetryDelayMs(syncOutbox.attempts - 1);
+  saveSyncOutbox();
+  if (isPersistentSyncFailure()) {
+    recordSyncErrorPersistent(err, "Background sync");
+  }
+  refreshSyncStatusPill();
+  scheduleDurableSyncWorker();
+}
+
+function noteOutboxSuccess() {
+  clearSyncOutbox();
+  lastNetworkFailAt = 0;
+  refreshSyncStatusPill();
+}
+
+/**
+ * Pill-only status: Synced / Syncing… / Offline.
+ * Error class only after persistent failures (Settings → Last error).
+ */
+function refreshSyncStatusPill(statusText) {
+  if (isDeviceOffline()) {
+    setSyncIndicator("offline", statusText || "Offline — will sync when online");
+    return;
+  }
+  const busy =
+    durableWorkerRunning ||
+    syncFlightDepth > 0 ||
+    !!syncTimer ||
+    localDirty ||
+    (syncOutbox && syncOutbox.dirty);
+  if (busy) {
+    if (isPersistentSyncFailure()) {
+      setSyncIndicator(
+        "error",
+        statusText || "Sync delayed — see Settings → Last error"
+      );
+    } else {
+      setSyncIndicator("pending", statusText || "Syncing…");
+    }
+    return;
+  }
+  const rev =
+    settings.lastSeenRevision != null ? " · rev " + settings.lastSeenRevision : "";
+  setSyncIndicator(
+    "ok",
+    statusText ||
+      (settings.lastSync
+        ? "Synced" + rev
+        : "Cloud ready")
+  );
+}
+
+function scheduleDurableSyncWorker(delayMs) {
+  clearTimeout(durableSyncTimer);
+  let delay = delayMs;
+  if (delay == null) {
+    if (syncOutbox.nextRetryAt) {
+      delay = Math.max(0, syncOutbox.nextRetryAt - Date.now());
+    } else {
+      delay = syncDebounceMs();
+    }
+  }
+  durableSyncTimer = setTimeout(function () {
+    durableSyncTimer = null;
+    runDurableSyncWorker();
+  }, Math.max(0, delay));
+}
+
+/** Kick the durable worker soon (after local edits / resume). */
+function kickDurableSync(opts) {
+  opts = opts || {};
+  markOutboxDirty();
+  localDirty = true;
+  if (!settings.scriptUrl || !settings.autoSync) {
+    refreshSyncStatusPill();
+    return;
+  }
+  refreshSyncStatusPill("Syncing…");
+  const delay = opts.immediate ? 0 : syncDebounceMs();
+  scheduleDurableSyncWorker(delay);
+}
+
+async function runDurableSyncWorker() {
+  if (durableWorkerRunning) return;
+  if (!settings.scriptUrl || settings.autoSync === false) return;
+  if (!localDirty && !(syncOutbox && syncOutbox.dirty) && !healPendingUpload) return;
+
+  if (isSyncTransportPaused()) {
+    refreshSyncStatusPill(
+      isDeviceOffline() ? "Offline — will sync when online" : "Syncing… (paused)"
+    );
+    return;
+  }
+
+  durableWorkerRunning = true;
+  refreshSyncStatusPill("Syncing…");
+  try {
+    // Not armed yet (startup/cloud unknown) → re-check cloud first.
+    if (!autoSyncArmed) {
+      await initSync();
+      if (!autoSyncArmed) {
+        if (localDirty || (syncOutbox && syncOutbox.dirty)) {
+          noteOutboxFail(new Error("Waiting for cloud readiness"));
+        }
+        return;
+      }
+      // Armed now — fall through to upload pending local edits.
+    }
+    const ok = await syncNow({ silent: true, fromDurable: true });
+    if (ok || (!localDirty && autoSyncArmed)) {
+      noteOutboxSuccess();
+    } else if (localDirty || (syncOutbox && syncOutbox.dirty)) {
+      if (isSyncTransportPaused()) {
+        refreshSyncStatusPill(isDeviceOffline() ? "Offline — will sync when online" : "Syncing… (paused)");
+        return;
+      }
+      noteOutboxFail(new Error("Sync still pending"));
+    }
+  } catch (err) {
+    noteOutboxFail(err);
+  } finally {
+    durableWorkerRunning = false;
+    refreshSyncStatusPill();
+  }
+}
+
+function onOnlineForSync() {
+  if (localDirty || (syncOutbox && syncOutbox.dirty) || healPendingUpload) {
+    kickDurableSync({ immediate: true });
+  }
+  if (settings.scriptUrl && settings.autoRefresh !== false && cloudChecked) {
+    pollCloud({ force: false });
+  }
+}
+
+function onOfflineForSync() {
+  refreshSyncStatusPill("Offline — will sync when online");
 }
 
 function isSyncWriteInFlight() {
@@ -2769,13 +3072,23 @@ function sleepMs(ms) {
  * fetch() on mobile Chrome/PWA throws "Failed to fetch" on GAS's
  * script.google.com → script.googleusercontent.com redirect, or else
  * returns the bare /exec "backend is running" body instead of JSON.
+ * Concurrent XHRs are serialized (enqueueGasXhr) so merge never aborts an
+ * in-flight info/load — overlapping requests often show up as HTTP 0 on Android.
  */
-function gasJsonGet(url) {
+function gasJsonGetOnce(url, opts) {
+  opts = opts || {};
   return new Promise(function (resolve, reject) {
+    if (isDeviceOffline()) {
+      reject(new GasHttpError(0, gasHttp0Message("XHR GET")));
+      return;
+    }
     const xhr = new XMLHttpRequest();
     xhr.open("GET", url, true);
-    xhr.timeout = 120000;
+    xhr.timeout = opts.timeoutMs != null ? opts.timeoutMs : GAS_XHR_TIMEOUT_MS;
     xhr.withCredentials = false;
+    if (opts.accept) {
+      try { xhr.setRequestHeader("Accept", opts.accept); } catch (_) { /* ignore */ }
+    }
     xhr.onload = function () {
       const text = xhr.responseText || "";
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -2796,10 +3109,48 @@ function gasJsonGet(url) {
       }
     };
     xhr.onerror = function () {
-      reject(new GasHttpError(0, "Network error — can't reach cloud (XHR GET)"));
+      reject(new GasHttpError(0, gasHttp0Message("XHR GET")));
     };
-    xhr.ontimeout = function () { reject(new Error("Cloud GET timed out (120s)")); };
+    xhr.ontimeout = function () {
+      reject(new Error("Cloud GET timed out (" + Math.round(xhr.timeout / 1000) + "s)"));
+    };
     xhr.send();
+  });
+}
+
+/** Cache-bust + Accept variants when the first XHR dies with status 0. */
+function gasGetAttemptUrls(url, attempt) {
+  const sep = url.indexOf("?") >= 0 ? "&" : "?";
+  const bust = url + sep + "_ah=" + Date.now().toString(36) + "r" + attempt;
+  if (attempt === 0) {
+    return [{ url: url }, { url: bust }];
+  }
+  return [
+    { url: bust },
+    { url: bust, accept: "application/json, text/plain, */*" },
+    { url: url, accept: "*/*" },
+  ];
+}
+
+function gasJsonGet(url) {
+  return enqueueGasXhr(async function () {
+    let lastErr = null;
+    for (let attempt = 0; attempt < GAS_GET_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) await sleepMs(GAS_RETRY_BASE_MS * Math.pow(2, attempt - 1));
+      const variants = gasGetAttemptUrls(url, attempt);
+      for (let v = 0; v < variants.length; v++) {
+        try {
+          const out = await gasJsonGetOnce(variants[v].url, { accept: variants[v].accept });
+          lastNetworkFailAt = 0;
+          return out;
+        } catch (err) {
+          lastErr = err;
+          if (!isTransientGasErr(err)) throw err;
+        }
+      }
+    }
+    noteNetworkFail(lastErr);
+    throw lastErr || new GasHttpError(0, gasHttp0Message("XHR GET"));
   });
 }
 
@@ -2807,13 +3158,16 @@ function gasJsonGet(url) {
  * POST via XMLHttpRequest — Google Apps Script redirects POST and fetch()
  * often turns it into a broken GET (404/411). XHR survives the redirect on mobile.
  */
-function gasPostJson(url, payload) {
-  const body = JSON.stringify(payload);
+function gasPostJsonOnce(url, body) {
   return new Promise(function (resolve, reject) {
+    if (isDeviceOffline()) {
+      reject(new GasHttpError(0, gasHttp0Message("XHR POST")));
+      return;
+    }
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url, true);
     xhr.setRequestHeader("Content-Type", "text/plain;charset=utf-8");
-    xhr.timeout = 120000;
+    xhr.timeout = GAS_XHR_TIMEOUT_MS;
     xhr.withCredentials = false;
     xhr.onload = function () {
       const text = xhr.responseText || "";
@@ -2833,10 +3187,32 @@ function gasPostJson(url, payload) {
       }
     };
     xhr.onerror = function () {
-      reject(new GasHttpError(0, "Network error — can't reach cloud (XHR POST)"));
+      reject(new GasHttpError(0, gasHttp0Message("XHR POST")));
     };
-    xhr.ontimeout = function () { reject(new Error("Upload timed out (120s)")); };
+    xhr.ontimeout = function () {
+      reject(new Error("Upload timed out (" + Math.round(xhr.timeout / 1000) + "s)"));
+    };
     xhr.send(body);
+  });
+}
+
+function gasPostJson(url, payload) {
+  const body = JSON.stringify(payload);
+  return enqueueGasXhr(async function () {
+    let lastErr = null;
+    for (let attempt = 0; attempt < GAS_POST_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) await sleepMs(GAS_RETRY_BASE_MS * Math.pow(2, attempt - 1));
+      try {
+        const out = await gasPostJsonOnce(url, body);
+        lastNetworkFailAt = 0;
+        return out;
+      } catch (err) {
+        lastErr = err;
+        if (!isTransientGasErr(err)) throw err;
+      }
+    }
+    noteNetworkFail(lastErr);
+    throw lastErr || new GasHttpError(0, gasHttp0Message("XHR POST"));
   });
 }
 
@@ -2844,14 +3220,16 @@ function gasPostJson(url, payload) {
  * Form-urlencoded POST with payload=base64(JSON). Works when text/plain POST
  * is stripped by a redirect but a form body still reaches Apps Script.
  */
-function gasPostForm(url, payload) {
-  const b64 = utf8ToBase64(JSON.stringify(payload));
-  const body = "payload=" + encodeURIComponent(b64);
+function gasPostFormOnce(url, body) {
   return new Promise(function (resolve, reject) {
+    if (isDeviceOffline()) {
+      reject(new GasHttpError(0, gasHttp0Message("form POST")));
+      return;
+    }
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url, true);
     xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded;charset=utf-8");
-    xhr.timeout = 120000;
+    xhr.timeout = GAS_XHR_TIMEOUT_MS;
     xhr.withCredentials = false;
     xhr.onload = function () {
       const text = xhr.responseText || "";
@@ -2871,10 +3249,33 @@ function gasPostForm(url, payload) {
       }
     };
     xhr.onerror = function () {
-      reject(new GasHttpError(0, "Network error — can't reach cloud (form POST)"));
+      reject(new GasHttpError(0, gasHttp0Message("form POST")));
     };
-    xhr.ontimeout = function () { reject(new Error("Form upload timed out (120s)")); };
+    xhr.ontimeout = function () {
+      reject(new Error("Form upload timed out (" + Math.round(xhr.timeout / 1000) + "s)"));
+    };
     xhr.send(body);
+  });
+}
+
+function gasPostForm(url, payload) {
+  const b64 = utf8ToBase64(JSON.stringify(payload));
+  const body = "payload=" + encodeURIComponent(b64);
+  return enqueueGasXhr(async function () {
+    let lastErr = null;
+    for (let attempt = 0; attempt < GAS_POST_MAX_ATTEMPTS; attempt++) {
+      if (attempt > 0) await sleepMs(GAS_RETRY_BASE_MS * Math.pow(2, attempt - 1));
+      try {
+        const out = await gasPostFormOnce(url, body);
+        lastNetworkFailAt = 0;
+        return out;
+      } catch (err) {
+        lastErr = err;
+        if (!isTransientGasErr(err)) throw err;
+      }
+    }
+    noteNetworkFail(lastErr);
+    throw lastErr || new GasHttpError(0, gasHttp0Message("form POST"));
   });
 }
 
@@ -2920,8 +3321,11 @@ function humanizeUploadError(err) {
   if (/invalid JSON|Empty response|HTML instead of JSON/i.test(msg)) {
     return "Cloud returned HTML instead of JSON — check Web App URL; paste full /exec URL";
   }
-  if (/Network error|Failed to fetch|Load failed|status\":\s*0|HTTP 0/i.test(msg)) {
-    return "Network error on upload — check connection; tap Retry connection; Settings → Last error for details";
+  if (/Network error|Failed to fetch|Load failed|status\":\s*0|HTTP 0|Device offline|can't reach cloud/i.test(msg)) {
+    if (isDeviceOffline() || /Device offline/i.test(msg)) {
+      return "Phone is offline — turn on Wi‑Fi/data, then tap Retry connection";
+    }
+    return "Cloud briefly unreachable (HTTP 0) — phone online but request failed; try Wi‑Fi, disable Private DNS/Data Saver, tap Retry connection; open test URL in Chrome if it persists";
   }
   if (/timed out/i.test(msg)) {
     return "Upload timed out — try again on Wi‑Fi";
@@ -3002,11 +3406,11 @@ function assertSaveTransportResult(out, via) {
   );
 }
 
-/** One chunk GET with retries — XHR only (never fetch; mobile Failed to fetch on GAS redirects). */
+/** One chunk GET — retries live inside gasJsonGet (avoid nested 3×3 storms). */
 async function gasGetSaveOnce(url) {
   let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) await sleepMs(200 * attempt);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await sleepMs(250 * attempt);
     try {
       const out = await gasJsonGet(url);
       if (isNoopBackendResponse(out) && !out.waiting && !out.conflict) {
@@ -3016,6 +3420,7 @@ async function gasGetSaveOnce(url) {
       return out;
     } catch (err) {
       lastErr = err;
+      if (!isTransientGasErr(err)) throw err;
     }
   }
   throw lastErr || new Error("GET save failed");
@@ -3130,11 +3535,33 @@ function recordSyncSuccess(kind) {
   updateSyncDiagnostics();
 }
 
-function recordSyncError(err, context) {
+/** Always write Settings → Last error (manual / persistent failures). */
+function recordSyncErrorPersistent(err, context) {
+  noteNetworkFail(err);
   const detail = formatSyncErrorDetail(err);
   const msg = (context ? context + ": " : "") + detail;
   settings.lastSyncError = { at: new Date().toISOString(), message: msg };
   saveSettings();
+  updateSyncDiagnostics();
+}
+
+/**
+ * Soft error recorder: transient HTTP 0 / network stays out of Settings until
+ * the durable outbox hits persistent failure (10 attempts or ~10 minutes).
+ * Non-transient errors always surface in Last error.
+ */
+function recordSyncError(err, context, opts) {
+  opts = opts || {};
+  noteNetworkFail(err);
+  if (opts.force || !isTransientGasErr(err) || isPersistentSyncFailure()) {
+    recordSyncErrorPersistent(err, context);
+    return;
+  }
+  // Keep outbox failure bookkeeping without scaring Settings yet.
+  if (syncOutbox) {
+    syncOutbox.lastError = formatSyncErrorDetail(err);
+    saveSyncOutbox();
+  }
   updateSyncDiagnostics();
 }
 
@@ -3170,6 +3597,7 @@ function setSyncIndicator(state, text) {
   const pillLabels = {
     ok: "Synced",
     pending: "Syncing…",
+    offline: "Offline",
     warn: "Sync warn",
     error: "Sync error"
   };
@@ -3350,11 +3778,8 @@ async function guardUploadAgainstLosingToday(opts) {
   if (!loaded || !loaded.data) return false;
   if (!cloudHasRicherToday(data, loaded.data)) return false;
   updateSyncSafetyText(loaded);
-  setSyncIndicator("pending", "Cloud has today's check-ins — merging…");
-  if (!opts.silent) {
-    toast("Cloud has today's check-ins — merging (not overwriting)");
-  }
-  await resolveConflictAuto(loaded, { silent: opts.silent, auto: !!opts.auto });
+  refreshSyncStatusPill("Syncing…");
+  await resolveConflictAuto(loaded, { silent: true, auto: !!opts.auto });
   return true;
 }
 
@@ -3693,8 +4118,9 @@ async function resolveConflictAutoBody(cloudOrOut, opts) {
         const loaded = await fetchCloudSnapshot();
         if (!loaded) {
           if (attempt < SYNC_CONFLICT_MAX_RETRIES - 1) continue;
-          setSyncIndicator("error", "Can't load cloud to resolve");
-          if (!opts.silent) toast("Can't reach cloud — data is safe locally");
+          refreshSyncStatusPill("Syncing…");
+          markOutboxDirty();
+          scheduleDurableSyncWorker();
           return false;
         }
         cloudData = loaded.data;
@@ -3704,8 +4130,10 @@ async function resolveConflictAutoBody(cloudOrOut, opts) {
       } catch (err) {
         lastTransportErr = err;
         if (attempt < SYNC_CONFLICT_MAX_RETRIES - 1) continue;
-        setSyncIndicator("error", "Can't load cloud to resolve");
-        if (!opts.silent) toast("Can't reach cloud — data is safe locally");
+        recordSyncError(err, "Merge load");
+        refreshSyncStatusPill("Syncing…");
+        markOutboxDirty();
+        scheduleDurableSyncWorker();
         return false;
       }
     }
@@ -3761,9 +4189,9 @@ async function resolveConflictAutoBody(cloudOrOut, opts) {
       // Transient transport — retry; only surface after all attempts.
       if (attempt < SYNC_CONFLICT_MAX_RETRIES - 1) continue;
       recordSyncError(err, "Merge upload");
-      const msg = humanizeUploadError(err);
-      setSyncIndicator("error", "Merged locally — upload failed: " + msg);
-      if (!opts.silent) toast("Couldn't finish sync — will keep trying (data safe on this phone)");
+      markOutboxDirty();
+      scheduleDurableSyncWorker();
+      refreshSyncStatusPill("Syncing…");
       return false;
     }
     if (pushed) {
@@ -3781,15 +4209,14 @@ async function resolveConflictAutoBody(cloudOrOut, opts) {
     attemptCloud = null; // force fresh load on next loop
   }
 
-  // All retries exhausted — data kept locally; avoid scary "tap Upload" wording.
-  const conflictMsg =
-    "Couldn't sync yet — data kept on this phone; tap Upload if it stays out of date";
+  // All retries exhausted — keep local punches; durable worker continues quietly.
   recordSyncError(
-    lastTransportErr || new Error(conflictMsg),
+    lastTransportErr || new Error("Merge still pending"),
     lastTransportErr ? "Merge upload" : "Merge conflict"
   );
-  setSyncIndicator("error", conflictMsg);
-  if (!opts.silent) toast(conflictMsg);
+  markOutboxDirty();
+  scheduleDurableSyncWorker();
+  refreshSyncStatusPill();
   return false;
 }
 
@@ -3822,8 +4249,16 @@ async function initSyncBody() {
     autoSyncArmed = false;
     cloudChecked = true;
     recordSyncError(err, "Startup");
-    setSyncIndicator("error", "Cloud check failed — " + err.message);
+    refreshSyncStatusPill(
+      isDeviceOffline() ? "Offline — will sync when online" : "Syncing…"
+    );
     updateSyncSafetyText(null);
+    if (localDirty || healPendingUpload || (syncOutbox && syncOutbox.dirty)) {
+      markOutboxDirty();
+      scheduleDurableSyncWorker();
+    } else {
+      scheduleDurableSyncWorker(syncRetryDelayMs(0));
+    }
     return;
   }
   cloudChecked = true;
@@ -3832,9 +4267,8 @@ async function initSyncBody() {
   // New / blank device with populated cloud → auto-restore (no reject modal).
   if (needsCloudOnboarding(cloud)) {
     autoSyncArmed = false;
-    setSyncIndicator("pending", "Syncing…");
-    toast("Syncing…");
-    await restoreFromSheet({ skipConfirm: true, auto: true });
+    refreshSyncStatusPill("Syncing…");
+    await restoreFromSheet({ skipConfirm: true, auto: true, toastMsg: null });
     startPolling();
     return;
   }
@@ -3878,12 +4312,20 @@ async function initSyncBody() {
 function queueSync() {
   markUserEdit();
   localDirty = true;
-  if (!settings.scriptUrl || !settings.autoSync) return;
-  if (!autoSyncArmed) return; // never auto-push before cloud state is known
-  setSyncIndicator("pending");
+  markOutboxDirty();
+  if (!settings.scriptUrl || !settings.autoSync) {
+    refreshSyncStatusPill();
+    return;
+  }
+  // Persist intent even if not armed yet — worker will initSync then upload.
+  refreshSyncStatusPill("Syncing…");
   clearTimeout(syncTimer);
-  syncTimer = setTimeout(() => { syncTimer = null; syncNow(); }, 2500);
+  syncTimer = setTimeout(() => {
+    syncTimer = null;
+    kickDurableSync({ immediate: true });
+  }, syncDebounceMs());
 }
+
 
 /**
  * POST current `data` with baseRevision. Returns true on success.
@@ -3951,6 +4393,7 @@ async function pushSnapshot(opts) {
   saveSettings();
   autoSyncArmed = true;
   localDirty = false;
+  clearSyncOutbox();
   recordSyncSuccess("push");
   updateSyncSafetyText(out);
   return true;
@@ -3968,26 +4411,43 @@ async function syncNow(opts) {
 
 async function syncNowBody(opts) {
   opts = opts || {};
+  const silent = !!opts.silent || !!opts.fromDurable;
   settings.scriptUrl = normalizeScriptUrl(settings.scriptUrl) || settings.scriptUrl;
   if (urlInput) urlInput.value = settings.scriptUrl || urlInput.value;
-  if (!settings.scriptUrl) { toast("Set the Web App URL in Settings first"); return; }
+  if (!settings.scriptUrl) {
+    if (!silent) toast("Set the Web App URL in Settings first");
+    return false;
+  }
 
-  // New/blank device with cloud data → restore first instead of uploading seeds.
+  if (isSyncTransportPaused() && !opts.force) {
+    refreshSyncStatusPill(
+      isDeviceOffline() ? "Offline — will sync when online" : "Syncing… (paused)"
+    );
+    markOutboxDirty();
+    return false;
+  }
+
   if (!opts.force && isFreshLocal()) {
     let cloud;
     try {
       cloud = await fetchCloudInfo();
     } catch (err) {
-      setSyncIndicator("error", "Can't reach cloud — not overwriting");
-      toast("Can't reach cloud — data is safe locally");
-      return;
+      recordSyncError(err, "Upload");
+      refreshSyncStatusPill(
+        isDeviceOffline() ? "Offline — will sync when online" : "Syncing…"
+      );
+      if (!silent && !isTransientGasErr(err)) {
+        toast("Can't reach cloud — data is safe locally");
+      }
+      markOutboxDirty();
+      scheduleDurableSyncWorker();
+      return false;
     }
     updateSyncSafetyText(cloud);
     if (cloud.hasData && !cloudSafeToOverwrite(cloud)) {
-      setSyncIndicator("pending", "Syncing…");
-      if (!opts.silent) toast("Syncing…");
-      await restoreFromSheet({ skipConfirm: true, auto: true });
-      return;
+      refreshSyncStatusPill("Syncing…");
+      const restored = await restoreFromSheet({ skipConfirm: true, auto: true, toastMsg: null });
+      return !!restored;
     }
     autoSyncArmed = true;
   } else if (!opts.force && !autoSyncArmed) {
@@ -3995,71 +4455,77 @@ async function syncNowBody(opts) {
     try {
       cloud = await fetchCloudInfo();
     } catch (err) {
-      setSyncIndicator("error", "Can't reach cloud — not overwriting");
-      toast("Can't reach cloud — data is safe locally");
-      return;
+      recordSyncError(err, "Upload");
+      refreshSyncStatusPill(
+        isDeviceOffline() ? "Offline — will sync when online" : "Syncing…"
+      );
+      if (!silent && !isTransientGasErr(err)) {
+        toast("Can't reach cloud — data is safe locally");
+      }
+      markOutboxDirty();
+      scheduleDurableSyncWorker();
+      return false;
     }
     updateSyncSafetyText(cloud);
     if (!cloudSafeToOverwrite(cloud)) {
-      await resolveConflictAuto(cloud, { silent: opts.silent });
-      return;
+      const resolved = await resolveConflictAuto(cloud, { silent: true });
+      return !!resolved;
     }
     autoSyncArmed = true;
   }
 
-  // Device missing today's punches must not clobber cloud that has them.
   if (!opts.force) {
     try {
-      if (await guardUploadAgainstLosingToday(opts)) return;
+      if (await guardUploadAgainstLosingToday({ silent: true, auto: !!opts.auto })) {
+        return !localDirty;
+      }
     } catch (err) {
-      setSyncIndicator("error", "Upload blocked: " + humanizeUploadError(err));
-      if (!opts.silent) toast("Upload blocked — see Settings → Last error");
       recordSyncError(err, "Upload guard");
-      return;
+      refreshSyncStatusPill("Syncing…");
+      if (!silent && !isTransientGasErr(err)) {
+        toast("Upload blocked — see Settings → Last error");
+      }
+      markOutboxDirty();
+      scheduleDurableSyncWorker();
+      return false;
     }
   }
 
-  setSyncIndicator("pending", opts.force ? "Uploading as master…" : (opts.silent ? "Syncing…" : "Uploading…"));
+  refreshSyncStatusPill(opts.force ? "Uploading as master…" : "Syncing…");
   try {
-    const ok = await pushSnapshot({ silent: opts.silent, force: !!opts.force });
+    const ok = await pushSnapshot({ silent: true, force: !!opts.force });
     if (!ok) {
-      // Conflict / merge path — resolveConflictAuto already retried; only toast if still dirty.
       if (!localDirty && autoSyncArmed) {
-        const rev = settings.lastSeenRevision != null ? " · rev " + settings.lastSeenRevision : "";
-        setSyncIndicator("ok", "Synced" + rev);
-        if (!opts.silent) toast("Synced");
-        return;
+        noteOutboxSuccess();
+        refreshSyncStatusPill();
+        if (!silent) toast("Synced");
+        return true;
       }
-      if (settings.lastSyncError && settings.lastSyncError.message) {
-        const raw = settings.lastSyncError.message
-          .replace(/^Upload:\s*/i, "")
-          .replace(/^Merge upload:\s*/i, "")
-          .replace(/^Merge conflict:\s*/i, "");
-        setSyncIndicator("error", raw);
-        // Avoid scary mid-merge toasts — resolve already retried; stay quiet when silent.
-        if (!opts.silent && /Couldn't sync|tap Upload|Replace with cloud/i.test(raw)) {
-          toast(raw.length > 100 ? "Couldn't sync yet — data kept on this phone" : raw);
-        }
-        return;
+      markOutboxDirty();
+      if (!opts.fromDurable) scheduleDurableSyncWorker();
+      refreshSyncStatusPill();
+      if (!silent && isPersistentSyncFailure()) {
+        toast("Couldn't sync yet — data kept on this phone");
       }
-      const msg = opts.force
-        ? "Master upload did not finish — try again"
-        : "Couldn't sync yet — data kept on this phone; tap Upload if needed";
-      recordSyncError(new Error(msg), "Upload conflict");
-      setSyncIndicator("error", msg);
-      if (!opts.silent) toast(msg);
-      return;
+      return false;
     }
-    const rev = settings.lastSeenRevision != null ? " · rev " + settings.lastSeenRevision : "";
-    setSyncIndicator("ok", "Uploaded: " + new Date(settings.lastSync).toLocaleString() + rev);
-    if (!opts.silent) toast(settings.lastSeenRevision != null ? "Synced" : "Synced ✓ (legacy backend)");
+    noteOutboxSuccess();
+    localDirty = false;
+    refreshSyncStatusPill();
+    if (!silent) toast(settings.lastSeenRevision != null ? "Synced" : "Synced ✓ (legacy backend)");
+    return true;
   } catch (err) {
     recordSyncError(err, "Upload");
-    const nice = humanizeUploadError(err);
-    setSyncIndicator("error", "Upload failed: " + nice);
-    if (!opts.silent) toast("Upload failed — see Settings → Last error");
+    markOutboxDirty();
+    if (!opts.fromDurable) noteOutboxFail(err);
+    else refreshSyncStatusPill();
+    if (!silent && (!isTransientGasErr(err) || isPersistentSyncFailure())) {
+      toast("Upload failed — see Settings → Last error");
+    }
+    return false;
   }
 }
+
 
 /** Explicit master upload — replaces cloud with this phone after confirm. */
 async function syncNowAsMaster() {
@@ -4116,16 +4582,25 @@ async function restoreFromSheet(opts) {
       setSyncIndicator("ok", (opts.auto ? "Loaded from Google Sheet" : "Restored from cloud") + rev);
       if (Object.prototype.hasOwnProperty.call(opts, "toastMsg")) {
         if (opts.toastMsg) toast(opts.toastMsg);
-      } else if (opts.auto) toast("Loaded from Google Sheet");
-      else if (opts.fromPoll) toast("Updated from cloud");
-      else toast(backedUp ? "Restored ✓ (local backup saved)" : "Restored from cloud ✓");
+      } else if (opts.fromPoll || opts.auto) {
+        /* pill-only */
+      } else {
+        toast(backedUp ? "Restored ✓ (local backup saved)" : "Restored from cloud ✓");
+      }
+      refreshSyncStatusPill();
       return true;
     }
     throw new Error("Sheet has no saved data yet");
   } catch (err) {
     recordSyncError(err, opts.fromPoll ? "Poll pull" : "Restore");
-    setSyncIndicator("error", "Restore failed: " + err.message);
-    if (!opts.fromPoll) toast("Restore failed: " + err.message);
+    refreshSyncStatusPill(
+      isTransientGasErr(err) || isDeviceOffline()
+        ? (isDeviceOffline() ? "Offline — will sync when online" : "Syncing…")
+        : null
+    );
+    if (!opts.fromPoll && !opts.auto && !isTransientGasErr(err)) {
+      toast("Restore failed: " + err.message);
+    }
     return false;
   }
 }
@@ -4156,8 +4631,10 @@ async function pollCloud(opts) {
   opts = opts || {};
   pollTimer = null;
   if (!settings.scriptUrl || settings.autoRefresh === false) return;
-  if (typeof document !== "undefined" && document.hidden) {
-    // Resume when the tab becomes visible again.
+  if (isSyncTransportPaused()) {
+    refreshSyncStatusPill(
+      isDeviceOffline() ? "Offline — will sync when online" : "Syncing… (paused)"
+    );
     return;
   }
   // Don't yank UI mid-edit (forced polls from tests/debug skip this).
@@ -4194,7 +4671,9 @@ async function pollCloudBody(opts) {
     cloud = await fetchCloudInfo();
   } catch (err) {
     recordSyncError(err, "Poll");
-    setSyncIndicator("error", "Cloud unreachable — " + err.message);
+    refreshSyncStatusPill(
+      isDeviceOffline() ? "Offline — will sync when online" : "Syncing…"
+    );
     scheduleNextPoll();
     return;
   }
@@ -4216,17 +4695,17 @@ async function pollCloudBody(opts) {
     } catch (_) {
       loaded = null;
     }
-    if (loaded && loaded.data && cloudHasRicherToday(data, loaded.data)) {
-      setSyncIndicator("pending", "Cloud has today's check-ins — merging…");
+    if (loaded && loaded.data && (cloudHasRicherToday(data, loaded.data) || (cloudAhead && localDirty))) {
+      refreshSyncStatusPill("Syncing…");
       await resolveConflictAuto(loaded, { silent: true, auto: true, fromPoll: true });
     } else if (cloudAhead) {
-      if (localDirty || syncTimer) {
-        await syncNow({ silent: true });
+      if (localDirty || syncTimer || (syncOutbox && syncOutbox.dirty)) {
+        await syncNow({ silent: true, fromDurable: true });
       } else if (autoSyncArmed || seen != null) {
-        await restoreFromSheet({ skipConfirm: true, fromPoll: true });
+        await restoreFromSheet({ skipConfirm: true, fromPoll: true, toastMsg: null });
       }
-    } else if (localDirty || syncTimer) {
-      await syncNow({ silent: true });
+    } else if (localDirty || syncTimer || (syncOutbox && syncOutbox.dirty)) {
+      await syncNow({ silent: true, fromDurable: true });
     }
   }
 
@@ -4240,11 +4719,18 @@ function onVisibilityForPoll() {
     pollTimer = null;
     nextPollAt = null;
     updateSyncSafetyText(null);
-  } else if (settings.scriptUrl && settings.autoRefresh !== false && cloudChecked) {
-    // Immediate cheap check on resume, then resume interval.
-    pollCloud();
+    refreshSyncStatusPill("Syncing… (paused)");
+  } else {
+    if (localDirty || (syncOutbox && syncOutbox.dirty) || healPendingUpload) {
+      kickDurableSync({ immediate: true });
+    }
+    if (settings.scriptUrl && settings.autoRefresh !== false && cloudChecked) {
+      pollCloud();
+    }
   }
 }
+
+
 
 /* ---------------- sync modals + status ---------------- */
 function formatAgo(ts) {
@@ -4549,6 +5035,8 @@ setInterval(() => {
 }, 5000);
 
 document.addEventListener("visibilitychange", onVisibilityForPoll);
+window.addEventListener("online", onOnlineForSync);
+window.addEventListener("offline", onOfflineForSync);
 
 // First launch → seed daily good habits; otherwise persist any migration upgrades
 if (!localStorage.getItem(LS_DATA)) {
@@ -4642,7 +5130,12 @@ if (btnSortHint) {
 render();
 
 // Establish cloud state before auto-sync may fire (fail-safe for new devices).
-initSync();
+initSync().then(function () {
+  if (localDirty || healPendingUpload || (syncOutbox && syncOutbox.dirty)) {
+    kickDurableSync({ immediate: true });
+  }
+  if (isDeviceOffline()) refreshSyncStatusPill("Offline — will sync when online");
+}).catch(function () { /* ignore */ });
 
 // Test hooks (sync-tests.js / manual debug). Harmless in production.
 try {
@@ -4657,7 +5150,9 @@ try {
       syncFlightDepth,
       syncFlightKind,
     }),
-    markDirty: () => { localDirty = true; },
+    markDirty: () => { localDirty = true; markOutboxDirty(); },
+    getOutbox: () => syncOutbox,
+    kickDurableSync,
     mergeHabitData,
     punchDay,
     unmatchedPlusStack,

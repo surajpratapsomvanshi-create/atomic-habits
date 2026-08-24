@@ -168,6 +168,11 @@ body {
   box-shadow: 0 0 8px rgba(251, 191, 36, 0.65);
   animation: statusPulse 1.2s ease-in-out infinite;
 }
+.status-pill.offline .status-dot {
+  background: var(--muted);
+  box-shadow: none;
+  animation: none;
+}
 .status-pill.error .status-dot {
   background: var(--red);
   box-shadow: 0 0 8px rgba(248, 113, 113, 0.65);

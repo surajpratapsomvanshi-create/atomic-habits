@@ -38,8 +38,8 @@ const LOG_SHEET = "Log";
 const BACKUP_SHEET = "_backup";
 const HISTORY_SHEET = "_history";
 const MAX_HISTORY = 20;
-/** Bump when redeploying; v37+ GET save; v39+ chunked GET save + form POST; v40+ locked PropertiesService chunks. */
-const BACKEND_VERSION = 40;
+/** Bump when redeploying; v37+ GET save; v39+ chunked GET save + form POST; v40+ locked PropertiesService chunks; v41+ longer locks, lean conflict responses. */
+const BACKEND_VERSION = 41;
 
 /* ---------------- HTTP entry points ---------------- */
 
@@ -135,7 +135,7 @@ function handleSaveChunk(p) {
   }
 
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(30000)) {
+  if (!lock.tryLock(45000)) {
     return json({ ok: false, error: "Server busy — try again in a few seconds" });
   }
   try {
@@ -195,7 +195,7 @@ function handleSaveChunk(p) {
 
 function withLock(fn) {
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(20000)) {
+  if (!lock.tryLock(45000)) {
     return json({ ok: false, error: "Server busy — try again in a few seconds" });
   }
   try {
@@ -250,14 +250,14 @@ function handleSave(body) {
       return json({
         ok: false, conflict: true, reason: "stale",
         revision: meta.revision, updatedAt: meta.updatedAt, deviceId: meta.deviceId,
-        data: cloudData, spreadsheetUrl: ss.getUrl(),
+        spreadsheetUrl: ss.getUrl(),
       });
     }
     if (!incomingHas) {
       return json({
         ok: false, conflict: true, reason: "blank",
         revision: meta.revision, updatedAt: meta.updatedAt, deviceId: meta.deviceId,
-        data: cloudData, spreadsheetUrl: ss.getUrl(),
+        spreadsheetUrl: ss.getUrl(),
       });
     }
   }
@@ -273,8 +273,10 @@ function handleSave(body) {
   };
   writeMeta(backup, newMeta);
   return json({
-    ok: true, savedAt: newMeta.updatedAt, revision: newMeta.revision,
-    updatedAt: newMeta.updatedAt, deviceId: newMeta.deviceId,
+    ok: true,
+    revision: newMeta.revision,
+    updatedAt: newMeta.updatedAt,
+    deviceId: newMeta.deviceId,
     spreadsheetUrl: ss.getUrl(),
   });
 }
